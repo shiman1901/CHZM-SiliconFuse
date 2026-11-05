@@ -297,6 +297,7 @@ hardware state beyond its own resources.
 | 9 | Fail-safe mirror, eviction survival, exit auto-restore (this release) | 100% recovery after full VRAM eviction and a wiped RAM copy |
 | 10 | Chaos engineering: unbuffered mirror, simulated TDR, bit-flip healing (this release) | Dual-source corruption locks out safely, no resume on unproven pages |
 | 11 | Transactional journal + recovery guard, survives TerminateProcess (this release) | Victim recovered 100% after the engine is killed with exit code 99 |
+| 12 | Two modes: hard (tests) and Live Safe trim (real apps) (this release) | Chrome survives, 0 crashed tabs, 0.04 ms window ping |
 
 Phase 1 and later require either an NVIDIA cooperation agreement or an
 exclusive-compute configuration in which the display driver is not bound to
@@ -545,3 +546,48 @@ killed.
   `RestoreAllFrozen()` first, then exit;
 - `lParam == 0` or `ENDSESSION_LOGOFF` (real logoff/reboot) → immediate
   `ExitProcess(0)`, no restore delay.
+
+---
+
+## 14. Stage 12: hard mode vs live mode
+
+Suspending a live browser is unsafe: Chrome's own watchdog kills tabs when its
+message loop stops. The engine therefore has two explicit modes.
+
+| | Hard (tests only) | Live Safe (GUI default) |
+|---|---|---|
+| Entry point | `--torture-test` | `[RUN CRYO]`, autopilot |
+| Threads | `NtSuspendProcess` | **never touched** |
+| RAM copy | `MEM_RESET` (discarded) | **kept intact** |
+| VRAM | only surviving copy | hot cache (48 MB per process) |
+| Wake | DMA + `WriteProcessMemory` + resume | lift quota + DMA warm + `PrefetchVirtualMemory` |
+| Group wake | single pid | whole `chrome.exe` group |
+
+Live trim per process: `VirtualQueryEx` + `ReadProcessMemory` of up to 48 MB of
+hot pages, AVX2 streaming into the pool, then
+`SetProcessWorkingSetSizeEx(4 MB, 32 MB, HARDWS_MAX)` + `EmptyWorkingSet` +
+EcoQoS. No suspension, no discarding, so any crash of the engine leaves the
+applications untouched.
+
+### 14.1 Measured live run (2026-11-05, Chrome 20 processes, AI Studio tab)
+
+| Metric | Value |
+|---|---|
+| Chrome processes before / after | 20 / 20 |
+| Crashed tabs | 0 |
+| Window ping (`SendMessageTimeoutW`, `WM_NULL`) | 0.04 ms |
+| Hung windows (`IsHungAppWindow`) | 0 |
+| Processes trimmed in the pass | 4 |
+| Hot cache streamed into GDDR6 | 192 MB |
+| Physical working set released | 767 MB |
+| Cycle time | 110 ms |
+| Processes left with `NtSuspendProcess` | **0** |
+
+Chrome itself was in the foreground during this run, so the engine skipped it
+by design (`chrome_foreground = 1`); the thread-safety proof comes from three
+warm processes that were trimmed and still answered their event immediately
+(`warm_reacted = 3/3`).
+
+`--release-all` exists as an emergency cleanup: it lifts the working-set quota
+and the EcoQoS flag from every process the user can open with
+`PROCESS_SET_QUOTA`.

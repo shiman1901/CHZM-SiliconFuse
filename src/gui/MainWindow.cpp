@@ -577,9 +577,9 @@ void MainWindow::DrawScene(HDC dc, int width, int height)
     if (cryo_) cryoStats = cryo_->GetStats();
 
     wchar_t cryoText[160];
-    swprintf_s(cryoText, L"CRYO SAVED: %.1f GB DDR4  |  WAKE %.1f MS  |  FROZEN %d",
+    swprintf_s(cryoText, L"CRYO SAVED: %.1f GB DDR4  |  WAKE %.1f MS  |  TRIMMED %d",
                (double)cryoStats.savedBytes / (1024.0 * 1024.0 * 1024.0),
-               cryoStats.lastWakeMs, cryoStats.frozen);
+               cryoStats.lastWakeMs, cryoStats.trimmed);
     DrawLabel(dc, fontMono_, cryoText,
               RECT{ pad, cryoY, cryoRunRect_.left - 12, cryoY + pillH }, kDim);
 

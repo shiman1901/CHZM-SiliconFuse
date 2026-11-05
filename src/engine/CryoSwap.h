@@ -78,6 +78,7 @@ struct CryoStats {
     bool busy = false;
 
     int frozen = 0;            // processes currently suspended + offloaded
+    int trimmed = 0;           // processes soft-trimmed (live mode)
     int compressed = 0;        // cumulative freeze count
     int skippedAudio = 0;
     int skippedCritical = 0;
@@ -112,6 +113,18 @@ struct CachedProcess {
     std::vector<CachedRegion> regions;
 };
 
+// Live-mode record: the RAM copy is untouched, VRAM only holds a hot cache.
+struct TrimmedProcess {
+    DWORD pid = 0;
+    std::wstring name;
+    uint64_t wsBefore = 0;
+    uint64_t wsAfter = 0;
+    uint64_t bytes = 0;
+    ULONGLONG trimmedAt = 0;
+    std::vector<CachedChunk> chunks;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+};
+
 // CryoSwap moves private pages of background processes into the GDDR6 pool,
 // tells the kernel to drop them (MEM_RESET: no pagefile write), clamps the
 // working set and suspends the process. Focus brings it back: MEM_RESET_UNDO
@@ -139,10 +152,16 @@ public:
     // Brings it back and resumes its threads.
     bool CryoRestore(DWORD pid, bool forceDma, RestoreResult& result);
 
+    // Live mode: soft trim, no suspend, no MEM_RESET (GUI default).
     int RunCycle(DWORD onlyPid = 0);
     int Reset();
     // Fail-safe: bring every frozen process back (used on exit and crashes).
     int RestoreAllFrozen();
+    // Live mode: lift quotas + DMA warm + prefetch for a whole exe group.
+    int WakeGroup(const std::wstring& name, double& ms);
+    int WakeAllTrimmed();
+    bool IsTrimmed(DWORD pid) const;
+    std::wstring TrimmedName(DWORD pid) const;
 
     bool IsFrozen(DWORD pid) const;
     bool WakeNow(DWORD pid, double& wakeMs);
@@ -163,6 +182,9 @@ private:
 
     bool IsCritical(const std::wstring& name) const;
     bool PlaceAndWrite(const uint8_t* data, uint32_t bytes, uint64_t& vramOffset);
+    bool TrimProcess(DWORD pid, const std::wstring& name, HANDLE process,
+                     TrimmedProcess& out);
+    int WakeTrimmedEntry(const TrimmedProcess& entry, double& dmaMBps);
     void JournalSync();
     void JournalSetState(DWORD pid, uint32_t state);
     void PublishCycle(int frozen, int skippedAudio, int skippedCritical, int skippedSmall,
@@ -190,4 +212,6 @@ private:
     std::atomic<bool> safeLockout_{ false };
     std::vector<JournalEntry> journal_;
     std::mutex journalMutex_;
+    std::vector<TrimmedProcess> trimmed_;
+    mutable std::mutex trimmedMutex_;
 };

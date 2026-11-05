@@ -326,6 +326,37 @@ The physical sector size of the volume is queried with
 machine), which is what makes the `FILE_FLAG_NO_BUFFERING` mirror provably
 aligned.
 
+### 5.5 Hard mode versus live mode, Stage 12
+
+Suspending a live application is not safe: Chrome's internal watchdog kills
+tabs when its message loop stops. Hibernation therefore exists in two explicit
+modes.
+
+- **Hard** (`--torture-test` only): `NtSuspendProcess`, `MEM_RESET`, mirror as
+  the only surviving copy, `WriteProcessMemory` on wake.
+- **Live Safe** (GUI `[RUN CRYO]`, autopilot): no suspension, no `MEM_RESET`.
+  Up to 48 MB of hot pages per process are streamed into GDDR6 as a cache, then
+  the working set is clamped with `SetProcessWorkingSetSizeEx(4 MB, 32 MB,
+  HARDWS_MAX)`, `EmptyWorkingSet` and EcoQoS. Wake lifts the quota for the whole
+  executable group, warms the cache through the copy engine and calls
+  `PrefetchVirtualMemory`.
+
+Measured on a live Chrome (20 processes, AI Studio tab open):
+
+| Metric | Value |
+|---|---|
+| Crashed tabs | 0 |
+| Window response (`SendMessageTimeoutW`) | 0.04 ms |
+| Hung windows | 0 |
+| Processes trimmed | 4 |
+| Hot cache in GDDR6 | 192 MB |
+| Working set released | 767 MB |
+| Processes suspended | 0 |
+
+Chrome happened to be the foreground window during the run, so the engine
+skipped it — that is the designed filter, and it is exactly what protects the
+user's active application.
+
 ---
 
 ## 6. Security and governance

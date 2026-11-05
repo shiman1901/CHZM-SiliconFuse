@@ -1,0 +1,67 @@
+﻿CHZM//SILICONFUSE  STAGE 12  LIVE COMBAT REPORT
+generated=2026-11-05 17:31:53
+mode=live safe trim (no suspend, no MEM_RESET)
+
+[TEST 1: BUILD]
+  exe_size_bytes = 1117414
+  hard_mode      = available only via --torture-test
+  live_mode      = quota + EmptyWorkingSet + EcoQoS, threads untouched
+
+[TEST 2: SNAPSHOT BEFORE]
+  chrome_pids_before   = 20
+  chrome_ws_before_mb  = 403.0
+  chrome_visible_windows = 1
+  chrome_above_50mb    = 1 (live trim threshold)
+    hwnd=0x0000000000080384 pid=1612 title=Оптимизация Прокси-Драйвера и | Google AI Studio - Google Chrome
+  foreground_pid       = 1612
+  chrome_foreground    = 1 (focused apps are skipped by design)
+  avail_ram_before_mb  = 10393
+
+[TEST 3: LIVE SAFE CRYOTRIM]
+  trimmed_count    = 4
+  hot_cache_mb     = 192 (streamed into GDDR6)
+  saved_ddr4_mb    = 767
+  cycle_ms         = 110.03
+  stored_trimmed   = 4
+  processes_frozen = 0 (must stay 0 in live mode)
+  trim_ingress_mbps= 1745.1
+  avail_ram_after_mb = 10416
+  avail_ram_delta_mb = 23
+
+[TEST 4: SURVIVAL + WINDOW RESPONSIVENESS]
+  chrome_pids_after    = 20
+  crashed_tabs         = 0
+  chrome_ws_after_mb   = 406.2
+  windows_probed       = 1
+  windows_answered     = 1
+  windows_hung         = 0 (must be 0)
+  ping_avg_ms          = 0.04 (must be < 10.0)
+  ping_worst_ms        = 0.04
+  verdict              = NO HANG, NO CRASH
+
+[TEST 4B: THREAD SAFETY (NO SUSPEND)
+  warm_processes      = 3
+  warm_trimmed        = 3
+  warm_reacted        = 3 (must equal warm_processes)
+  worst_react_ms      = 278.58 (exit + self-verify, threads alive)
+
+[TEST 5: VRAM PRESSURE (GRANULAR YIELD)]
+  slices_before  = 4 (4096 MB)
+  slices_6gb     = 6 (6144 MB)
+  slices_after   = 4 (4096 MB)
+  commit_free_mb = 21456
+
+[TEST 6: GROUP WAKE (SIMULATED ALT+TAB)
+  woken_processes  = 0 (all chrome.exe)
+  wake_ms          = 0.00
+  chrome_ws_wake_mb= 399.0
+  remaining_trimmed= 4 (other applications)
+
+[TEST 7: FINAL CLEANUP (RESET)
+  flushed_processes = 1
+  flush_ms          = 0.00
+  trimmed_left      = 0 (must be 0)
+
+[RESULT]
+  status = PASS
+  note   = live mode never suspends threads and never issues MEM_RESET

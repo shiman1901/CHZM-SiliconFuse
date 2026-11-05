@@ -566,6 +566,342 @@ int RunFreezeVictim(DWORD victimPid, const std::wstring& dataDir)
     return 0;
 }
 
+int RunReleaseAll()
+{
+    std::vector<DWORD> pids(4096);
+    DWORD needed = 0;
+    if (!EnumProcesses(pids.data(), (DWORD)(pids.size() * sizeof(DWORD)), &needed)) return 2;
+    size_t count = needed / sizeof(DWORD);
+    if (count > pids.size()) count = pids.size();
+
+    const DWORD self = GetCurrentProcessId();
+    int released = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const DWORD pid = pids[i];
+        if (!pid || pid == 4 || pid == self) continue;
+        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION,
+                                     FALSE, pid);
+        if (!process) continue;
+        if (SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0)) ++released;
+        PROCESS_POWER_THROTTLING_STATE state{};
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        state.StateMask = 0;
+        SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
+        CloseHandle(process);
+    }
+    return released > 0 ? 0 : 1;
+}
+
+// ------------------------------------------------------- live combat --------
+
+std::vector<DWORD> PidsByName(const std::wstring& target)
+{
+    std::vector<DWORD> result;
+    std::vector<DWORD> pids(4096);
+    DWORD needed = 0;
+    if (!EnumProcesses(pids.data(), (DWORD)(pids.size() * sizeof(DWORD)), &needed)) {
+        return result;
+    }
+    size_t count = needed / sizeof(DWORD);
+    if (count > pids.size()) count = pids.size();
+    for (size_t i = 0; i < count; ++i) {
+        const DWORD pid = pids[i];
+        if (!pid) continue;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) continue;
+        wchar_t path[MAX_PATH * 2]{};
+        DWORD size = (DWORD)(sizeof(path) / sizeof(path[0]));
+        if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+            std::wstring full(path, size);
+            const size_t slash = full.find_last_of(L"\\/");
+            std::wstring base = slash == std::wstring::npos ? full : full.substr(slash + 1);
+            for (wchar_t& c : base) c = (wchar_t)towlower(c);
+            if (base == target) result.push_back(pid);
+        }
+        CloseHandle(process);
+    }
+    return result;
+}
+
+struct WindowRef {
+    HWND hwnd = nullptr;
+    DWORD pid = 0;
+    std::wstring title;
+};
+
+BOOL CALLBACK CollectWindow(HWND hwnd, LPARAM param)
+{
+    auto* out = reinterpret_cast<std::vector<WindowRef>*>(param);
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return TRUE;
+    wchar_t title[256]{};
+    GetWindowTextW(hwnd, title, 256);
+    if (!title[0]) return TRUE;
+    out->push_back(WindowRef{ hwnd, pid, title });
+    return TRUE;
+}
+
+std::vector<WindowRef> VisibleWindowsOf(const std::vector<DWORD>& pids)
+{
+    std::vector<WindowRef> all;
+    EnumWindows(CollectWindow, reinterpret_cast<LPARAM>(&all));
+    std::vector<WindowRef> filtered;
+    for (const WindowRef& window : all) {
+        if (std::find(pids.begin(), pids.end(), window.pid) != pids.end()) {
+            filtered.push_back(window);
+        }
+    }
+    return filtered;
+}
+
+struct PingResult {
+    bool answered = false;
+    bool hung = true;
+    double ms = 0.0;
+};
+
+PingResult PingWindow(HWND hwnd)
+{
+    PingResult result;
+    result.hung = IsHungAppWindow(hwnd) != FALSE;
+    Timer timer;
+    timer.Begin();
+    DWORD_PTR reply = 0;
+    const LRESULT ok = SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
+                                           SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &reply);
+    result.ms = timer.Ms();
+    result.answered = ok != 0;
+    return result;
+}
+
+double SumWorkingSetMb(const std::vector<DWORD>& pids)
+{
+    double total = 0.0;
+    for (DWORD pid : pids) {
+        const ProcNumbers numbers = ReadProcessNumbers(pid);
+        if (numbers.wsMb > 0.0) total += numbers.wsMb;
+    }
+    return total;
+}
+
+int RunLiveCombat(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
+                  const std::wstring& dataDir)
+{
+    const std::wstring docs = ExecutableDir() + L"\\..\\docs";
+    const std::wstring path =
+        GetFileAttributesW(docs.c_str()) != INVALID_FILE_ATTRIBUTES
+            ? docs + L"\\STAGE12_LIVE_COMBAT_REPORT.txt"
+            : dataDir + L"\\STAGE12_LIVE_COMBAT_REPORT.txt";
+    FILE* out = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
+    if (!out) return 6;
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    Report(out, L"CHZM//SILICONFUSE  STAGE 12  LIVE COMBAT REPORT");
+    Report(out, L"generated=%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth,
+           now.wDay, now.wHour, now.wMinute, now.wSecond);
+    Report(out, L"mode=live safe trim (no suspend, no MEM_RESET)");
+    Report(out, L"");
+
+    Report(out, L"[TEST 1: BUILD]");
+    wchar_t exePath[MAX_PATH * 2]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo{};
+    GetFileAttributesExW(exePath, GetFileExInfoStandard, &fileInfo);
+    Report(out, L"  exe_size_bytes = %llu",
+           (unsigned long long)(((uint64_t)fileInfo.nFileSizeHigh << 32) |
+                                fileInfo.nFileSizeLow));
+    Report(out, L"  hard_mode      = available only via --torture-test");
+    Report(out, L"  live_mode      = quota + EmptyWorkingSet + EcoQoS, threads untouched");
+    Report(out, L"");
+
+    // Three warm processes of our own: if anything suspended them, they would
+    // not answer the verify event after the trim.
+    std::vector<VictimHandle> warm;
+    const uint64_t warmSizes[3] = { 180, 220, 260 };
+    for (int i = 0; i < 3; ++i) {
+        VictimHandle handle;
+        if (StartVictim(warmSizes[i], (uint32_t)(60 + i), handle)) {
+            warm.push_back(handle);
+        }
+    }
+    // -------------------------------------------------- BEFORE ------------
+    const std::vector<DWORD> chromeBefore = PidsByName(L"chrome.exe");
+    const double chromeWsBefore = SumWorkingSetMb(chromeBefore);
+    const std::vector<WindowRef> windows = VisibleWindowsOf(chromeBefore);
+    const uint64_t availBefore = AvailablePhysicalMb();
+
+    Report(out, L"[TEST 2: SNAPSHOT BEFORE]");
+    Report(out, L"  chrome_pids_before   = %d", (int)chromeBefore.size());
+    Report(out, L"  chrome_ws_before_mb  = %.1f", chromeWsBefore);
+    int chromeAboveThreshold = 0;
+    for (DWORD pid : chromeBefore) {
+        if (ReadProcessNumbers(pid).wsMb >= 50.0) ++chromeAboveThreshold;
+    }
+    Report(out, L"  chrome_visible_windows = %d", (int)windows.size());
+    Report(out, L"  chrome_above_50mb    = %d (live trim threshold)", chromeAboveThreshold);
+    for (const WindowRef& window : windows) {
+        Report(out, L"    hwnd=0x%p pid=%lu title=%ls", (void*)window.hwnd,
+               (unsigned long)window.pid, window.title.c_str());
+    }
+    const DWORD foregroundNow = []() {
+        const HWND window = GetForegroundWindow();
+        DWORD pid = 0;
+        if (window) GetWindowThreadProcessId(window, &pid);
+        return pid;
+    }();
+    const bool chromeFocused =
+        std::find(chromeBefore.begin(), chromeBefore.end(), foregroundNow) != chromeBefore.end();
+    Report(out, L"  foreground_pid       = %lu", (unsigned long)foregroundNow);
+    Report(out, L"  chrome_foreground    = %d (focused apps are skipped by design)",
+           chromeFocused ? 1 : 0);
+    Report(out, L"  avail_ram_before_mb  = %llu", (unsigned long long)availBefore);
+    Report(out, L"");
+
+    // -------------------------------------------------- TRIM --------------
+
+    Timer cycleTimer;
+    cycleTimer.Begin();
+    const int trimmed = cryo.RunCycle();
+    const double cycleMs = cycleTimer.Ms();
+    const CryoStats stats = cryo.GetStats();
+    const uint64_t availAfterTrim = AvailablePhysicalMb();
+
+    Report(out, L"[TEST 3: LIVE SAFE CRYOTRIM]");
+    Report(out, L"  trimmed_count    = %d", trimmed);
+    Report(out, L"  hot_cache_mb     = %llu (streamed into GDDR6)",
+           (unsigned long long)(stats.hotBytes / kMb));
+    Report(out, L"  saved_ddr4_mb    = %llu", (unsigned long long)(stats.savedBytes / kMb));
+    Report(out, L"  cycle_ms         = %.2f", cycleMs);
+    Report(out, L"  stored_trimmed   = %d", stats.trimmed);
+    Report(out, L"  processes_frozen = %d (must stay 0 in live mode)", stats.frozen);
+    Report(out, L"  trim_ingress_mbps= %.1f", cycleMs > 0.0 ? (double)stats.hotBytes / (1024.0 * 1024.0) / (cycleMs / 1000.0) : 0.0);
+    Report(out, L"  avail_ram_after_mb = %llu", (unsigned long long)availAfterTrim);
+    Report(out, L"  avail_ram_delta_mb = %lld",
+           (long long)availAfterTrim - (long long)availBefore);
+    pool.LogSensors(L"live-trim");
+    Report(out, L"");
+
+    // --------------------------------------------- SURVIVAL + RESPONSIVENESS
+    Sleep(3000); // Chrome's own watchdog window
+
+    const std::vector<DWORD> chromeAfter = PidsByName(L"chrome.exe");
+    const double chromeWsAfter = SumWorkingSetMb(chromeAfter);
+
+    int hung = 0;
+    int answered = 0;
+    double worstMs = 0.0;
+    double totalMs = 0.0;
+    for (const WindowRef& window : windows) {
+        if (!IsWindow(window.hwnd)) continue;
+        const PingResult ping = PingWindow(window.hwnd);
+        if (ping.hung) ++hung;
+        if (ping.answered) ++answered;
+        totalMs += ping.ms;
+        if (ping.ms > worstMs) worstMs = ping.ms;
+    }
+    const double averageMs = answered > 0 ? totalMs / answered : 0.0;
+
+    Report(out, L"[TEST 4: SURVIVAL + WINDOW RESPONSIVENESS]");
+    Report(out, L"  chrome_pids_after    = %d", (int)chromeAfter.size());
+    Report(out, L"  crashed_tabs         = %d", (int)chromeBefore.size() - (int)chromeAfter.size());
+    Report(out, L"  chrome_ws_after_mb   = %.1f", chromeWsAfter);
+    Report(out, L"  windows_probed       = %d", (int)windows.size());
+    Report(out, L"  windows_answered     = %d", answered);
+    Report(out, L"  windows_hung         = %d (must be 0)", hung);
+    Report(out, L"  ping_avg_ms          = %.2f (must be < 10.0)", averageMs);
+    Report(out, L"  ping_worst_ms        = %.2f", worstMs);
+    Report(out, L"  verdict              = %ls",
+           (hung == 0 && averageMs < 10.0 &&
+            chromeAfter.size() >= chromeBefore.size())
+               ? L"NO HANG, NO CRASH"
+               : L"CHECK REQUIRED");
+    Report(out, L"");
+
+    // Threads must never be suspended: the warm processes are trimmed and
+    // still answer their verify event instantly.
+    int warmTrimmed = 0;
+    int warmReacted = 0;
+    double worstReactMs = 0.0;
+    for (VictimHandle& handle : warm) {
+        if (cryo.IsTrimmed(handle.marker.pid)) ++warmTrimmed;
+        Timer react;
+        react.Begin();
+        if (handle.verify) SetEvent(handle.verify);
+        const DWORD wait = WaitForSingleObject(handle.child.hProcess, 2000);
+        const double ms = react.Ms();
+        if (wait == WAIT_OBJECT_0) {
+            ++warmReacted;
+            if (ms > worstReactMs) worstReactMs = ms;
+        }
+    }
+    Report(out, L"[TEST 4B: THREAD SAFETY (NO SUSPEND)");
+    Report(out, L"  warm_processes      = %d", (int)warm.size());
+    Report(out, L"  warm_trimmed        = %d", warmTrimmed);
+    Report(out, L"  warm_reacted        = %d (must equal warm_processes)", warmReacted);
+    Report(out, L"  worst_react_ms      = %.2f (exit + self-verify, threads alive)",
+           worstReactMs);
+    for (VictimHandle& handle : warm) StopVictim(handle);
+    warm.clear();
+    Report(out, L"");
+
+    // ------------------------------------------- VRAM PRESSURE (6 GB) -----
+    const PoolStats before = pool.GetStats();
+    pool.RequestResize(6144);
+    Sleep(500);
+    const PoolStats pressed = pool.GetStats();
+    pool.RequestResize(4096);
+    Sleep(400);
+    const PoolStats relieved = pool.GetStats();
+
+    Report(out, L"[TEST 5: VRAM PRESSURE (GRANULAR YIELD)]");
+    Report(out, L"  slices_before  = %d (%llu MB)", before.sliceCount,
+           (unsigned long long)(before.poolBytes / kMb));
+    Report(out, L"  slices_6gb     = %d (%llu MB)", pressed.sliceCount,
+           (unsigned long long)(pressed.poolBytes / kMb));
+    Report(out, L"  slices_after   = %d (%llu MB)", relieved.sliceCount,
+           (unsigned long long)(relieved.poolBytes / kMb));
+    Report(out, L"  commit_free_mb = %llu", (unsigned long long)FreeCommitMb());
+    Report(out, L"");
+
+    // ------------------------------------------------ WAKE (ALT+TAB) ------
+    double wakeMs = 0.0;
+    const int woken = cryo.WakeGroup(L"chrome.exe", wakeMs);
+    Sleep(400);
+    const std::vector<DWORD> chromeWake = PidsByName(L"chrome.exe");
+    const double chromeWsWake = SumWorkingSetMb(chromeWake);
+
+    Report(out, L"[TEST 6: GROUP WAKE (SIMULATED ALT+TAB)");
+    Report(out, L"  woken_processes  = %d (all chrome.exe)", woken);
+    Report(out, L"  wake_ms          = %.2f", wakeMs);
+    Report(out, L"  chrome_ws_wake_mb= %.1f", chromeWsWake);
+    Report(out, L"  remaining_trimmed= %d (other applications)", cryo.GetStats().trimmed);
+    Report(out, L"");
+
+    // Release every remaining application so the machine is left clean.
+    double flushMs = 0.0;
+    const int flushed = cryo.WakeAllTrimmed();
+    RunReleaseAll(); // also clears quotas left by earlier runs
+    Report(out, L"[TEST 7: FINAL CLEANUP (RESET)");
+    Report(out, L"  flushed_processes = %d", flushed);
+    Report(out, L"  flush_ms          = %.2f", flushMs);
+    Report(out, L"  trimmed_left      = %d (must be 0)", cryo.GetStats().trimmed);
+    Report(out, L"");
+
+    Report(out, L"[RESULT]");
+    const bool pass = (hung == 0) && (averageMs < 10.0) &&
+                      (chromeAfter.size() >= chromeBefore.size()) &&
+                      (cryo.GetStats().trimmed == 0);
+    Report(out, L"  status = %ls", pass ? L"PASS" : L"FAIL");
+    Report(out, L"  note   = live mode never suspends threads and never issues MEM_RESET");
+    fclose(out);
+
+    return pass ? 0 : 1;
+}
+
 // --------------------------------------------------------------- report -----
 
 double SumFreezePhases(const FreezeResult& f)
@@ -1175,13 +1511,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
         return RunFreezeVictim(ParsePidAfter(arguments, L"--freeze-victim"),
                                ResolveDataDir());
     }
+    if (arguments.find(L"--release-all") != std::wstring::npos) {
+        return RunReleaseAll();
+    }
 
     const std::wstring dataDir = ResolveDataDir();
     CreateDirectoryW(dataDir.c_str(), nullptr);
     const std::wstring logPath = dataDir + L"\\engine.log";
     const bool torture = arguments.find(L"--torture-test") != std::wstring::npos;
     const bool selfTest = arguments.find(L"--self-test") != std::wstring::npos;
-    const bool headless = torture || selfTest;
+    const bool liveCombat = arguments.find(L"--live-combat-test") != std::wstring::npos;
+    const bool headless = torture || selfTest || liveCombat;
 
     CryoSwap::EnablePrivileges();
 
@@ -1246,7 +1586,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
              (unsigned long)paging.ntstatus);
 
     if (headless) {
-        const int result = RunTorture(pool, cryo, bridge, dataDir, torture);
+        const int result = liveCombat
+                               ? RunLiveCombat(pool, cryo, bridge, dataDir)
+                               : RunTorture(pool, cryo, bridge, dataDir, torture);
         cryo.Shutdown();
         pool.Shutdown();
         bridge.Shutdown();
