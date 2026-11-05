@@ -54,8 +54,10 @@ public:
     ~VramPool();
 
     // targetMb == 0 selects the automatic size for the detected adapter.
+    // allocateSlices == false skips the GB-sized D3D12 allocations entirely
+    // (Game-Aware VRAM Yield: keep 100% of the framebuffer for the game).
     bool Init(StorageBridge* bridge, uint32_t targetMb, uint32_t sliceMb,
-              const std::wstring& logPath);
+              const std::wstring& logPath, bool allocateSlices = true);
     void Shutdown();
 
     // Adaptive sizing. The monitor thread owns the slice vector; the UI only
@@ -188,5 +190,6 @@ private:
     mutable std::mutex opMutex_;
     uint64_t writeOffset_ = 0;
     std::atomic<bool> deviceRemoved_{ false };
+    std::atomic<bool> deferSlices_{ false };
     PoolStats stats_;
 };

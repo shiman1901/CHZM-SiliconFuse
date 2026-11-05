@@ -1144,7 +1144,7 @@ bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE proce
         commandLine.find(L"--type=gpu-process") != std::wstring::npos ||
         commandLine.find(L"--type=utility") != std::wstring::npos ||
         commandLine.find(L"--type=crashpad-handler") != std::wstring::npos ||
-        name == L"telegram.exe" || name == L"discord.exe";
+        name == L"telegram.exe";
     out.protectedRole = protectedRole;
 
     int64_t systemDelta = 0;

@@ -113,10 +113,11 @@ void VramPool::Log(const wchar_t* format, ...)
 }
 
 bool VramPool::Init(StorageBridge* bridge, uint32_t targetMb, uint32_t sliceMb,
-                    const std::wstring& logPath)
+                    const std::wstring& logPath, bool allocateSlices)
 {
     bridge_ = bridge;
     logPath_ = logPath;
+    deferSlices_ = !allocateSlices;
     logFile_ = _wfsopen(logPath.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
     if (!logFile_) return false;
 
@@ -135,13 +136,20 @@ bool VramPool::Init(StorageBridge* bridge, uint32_t targetMb, uint32_t sliceMb,
         return false;
     }
 
-    unsigned util = 0;
-    const bool haveUtil = QueryNvmlUtil(util);
-    if (haveUtil && util > 40) {
-        Log(L"[pool] GPU busy (%u%%), pool allocation deferred", util);
+    if (deferSlices_.load()) {
+        // Game-Aware VRAM Yield: an active 3D game owns the framebuffer, so we
+        // keep every slice unallocated and leave 100% of VRAM to the game.
+        Log(L"[pool] game-aware yield: slice allocation skipped, %u MB reserved",
+            targetMb_.load());
     } else {
-        if (!AllocateSlices(targetBytes, sliceBytes_)) {
-            Log(L"[pool] no slices allocated");
+        unsigned util = 0;
+        const bool haveUtil = QueryNvmlUtil(util);
+        if (haveUtil && util > 40) {
+            Log(L"[pool] GPU busy (%u%%), pool allocation deferred", util);
+        } else {
+            if (!AllocateSlices(targetBytes, sliceBytes_)) {
+                Log(L"[pool] no slices allocated");
+            }
         }
     }
 
@@ -672,8 +680,9 @@ void VramPool::MonitorLoop()
 
         PublishStats();
 
-        // No slices at all (startup guard): retry when the GPU is idle.
-        if (slices_.empty() && !stop_.load()) {
+        // No slices at all (startup guard): retry when the GPU is idle. In
+        // game-aware yield mode we must never do this.
+        if (slices_.empty() && !stop_.load() && !deferSlices_.load()) {
             unsigned util = 0;
             if (QueryNvmlUtil(util) && util < 20) {
                 AllocateSlices((uint64_t)targetMb_.load() * kMb, sliceBytes_);

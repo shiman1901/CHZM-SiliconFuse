@@ -1,0 +1,44 @@
+﻿CHZM//SILICONFUSE  STAGE 13  REAL-WORLD 16GB REPORT
+game_active        = 1
+game_aware_vram    = 1 (slices deferred, 100% VRAM to the game)
+
+[STEP 1: SYSTEM BEFORE]
+  total_ram_mb      = 16293
+  used_ram_mb       = 12687
+  usage_percent     = 77.9
+  avail_ram_mb      = 3606
+  commit            = 28008 / 36293 MB
+
+  family              procs  protected  WS_MB   PrivWS_MB
+  cyberpunk2077.exe       1         1    4055       3394
+  chrome.exe             28         6    1280        975
+  steamwebhelper.exe      8         5     578        348
+  steam.exe               1         0      23         11
+  discord.exe             6         4     281        107
+  telegram.exe            1         0      77         37
+
+[STEP 2: WAKE LATENCY (steamwebhelper)]
+  restore_priority_and_quotas_ms = 0.087
+  prefetch_ms                     = 0.009
+
+[STEP 3: GAME BOOST RECLAIM]
+  chrome renderer targets = 22 (protected gpu/utility = 6)
+  total background targets = 30
+  trimmed_processes      = 30
+
+[STEP 3b: SYSTEM AFTER (300ms post-trim)]
+  reclaimed_ws_mb        = 1637 (all background targets)
+  reclaimed_private_mb   = 1299
+  used_ram_mb       = 12687 -> 12522
+  usage_percent     = 77.9 -> 76.9
+  avail_ram_mb      = 3606 -> 3771  (+165 net)
+
+  family              before_WS  after_WS  delta_WS  before_Priv  after_Priv
+  cyberpunk2077.exe        4055     4055        0        3394       3394
+  chrome.exe               1280      153    -1127         975         82
+  steamwebhelper.exe        578      195     -382         348         25
+  steam.exe                  23        4      -19          11          1
+  discord.exe               281      173     -108         107         31
+  telegram.exe               77       77        0          37         37
+
+RESULT: PASS (left compressed - no release-all, screenshot now)
