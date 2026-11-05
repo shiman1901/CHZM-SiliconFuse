@@ -1,4 +1,5 @@
 #include "VramPool.h"
+#include "CommitGuard.h"
 #include "StorageBridge.h"
 
 #include <immintrin.h>
@@ -84,10 +85,12 @@ bool CreateHeapBuffer(ID3D12Device* device, uint64_t bytes, D3D12_HEAP_TYPE type
 
 struct NvmlMemory { unsigned long long total, free, used; };
 struct NvmlUtilization { unsigned int gpu, memory; };
+struct NvmlBar1 { unsigned long long total, free, used; };
 typedef int (*PfnNvmlInit)(void);
 typedef int (*PfnNvmlHandle)(unsigned int, void**);
 typedef int (*PfnNvmlMemory)(void*, NvmlMemory*);
 typedef int (*PfnNvmlUtil)(void*, NvmlUtilization*);
+typedef int (*PfnNvmlBar1)(void*, NvmlBar1*);
 
 } // namespace
 
@@ -206,6 +209,8 @@ bool VramPool::CreateDevice()
     Log(L"[pool] adapter vram=%llu MB auto_target=%u MB nvidia=%d",
         (unsigned long long)(adapterVramBytes_ / kMb), autoTargetMb_,
         bestNvidia ? 1 : 0);
+    Log(L"[commit] free=%llu MB limit=%llu MB", (unsigned long long)FreeCommitMb(),
+        (unsigned long long)TotalCommitLimitMb());
 
     if (FAILED(adapter1->QueryInterface(IID_PPV_ARGS(&adapter3_))) ||
         FAILED(D3D12CreateDevice(adapter1, D3D_FEATURE_LEVEL_11_0,
@@ -240,6 +245,8 @@ bool VramPool::CreateDevice()
             GetProcAddress(nvmlModule_, "nvmlDeviceGetMemoryInfo"));
         nvmlGetUtil_ = reinterpret_cast<void*>(
             GetProcAddress(nvmlModule_, "nvmlDeviceGetUtilizationRates"));
+        nvmlGetBar1_ = reinterpret_cast<void*>(
+            GetProcAddress(nvmlModule_, "nvmlDeviceGetBAR1MemoryInfo"));
         if (init && getHandle && init() == 0 && getHandle(0, &nvmlDevice_) == 0) {
             Log(L"[pool] NVML available");
         } else {
@@ -280,6 +287,17 @@ bool VramPool::QueryNvmlUtil(unsigned& percent) const
     return true;
 }
 
+bool VramPool::QueryNvmlBar1(uint64_t& usedBytes, uint64_t& totalBytes) const
+{
+    if (!nvmlDevice_ || !nvmlGetBar1_) return false;
+    NvmlBar1 bar1{};
+    auto fn = reinterpret_cast<PfnNvmlBar1>(nvmlGetBar1_);
+    if (fn(nvmlDevice_, &bar1) != 0) return false;
+    usedBytes = bar1.used;
+    totalBytes = bar1.total;
+    return true;
+}
+
 bool VramPool::PrepareStaging(uint64_t bytes)
 {
     stageBytes_ = bytes;
@@ -296,6 +314,15 @@ bool VramPool::PrepareStaging(uint64_t bytes)
 
 bool VramPool::AddSlice(uint64_t bytes)
 {
+    // CommitGuard: never let the pool eat the WDDM commit reserve.
+    const uint64_t freeCommit = FreeCommitMb();
+    if (freeCommit < kCommitGuardFloorMb) {
+        Log(L"[commit] slice refused: free commit %llu MB < %llu MB",
+            (unsigned long long)freeCommit,
+            (unsigned long long)kCommitGuardFloorMb);
+        return false;
+    }
+
     Slice slice;
     if (!CreateCustomL1(device_, bytes, &slice.resource)) return false;
     if (FAILED(slice.resource->Map(0, nullptr, &slice.cpu))) {
@@ -389,6 +416,12 @@ bool VramPool::ResizeTo(uint32_t targetMb)
 
 void VramPool::RequestResize(uint32_t targetMb)
 {
+    if (!monitorRunning_) {
+        // Headless tooling (--torture-test) has no monitor thread: apply now.
+        ResizeTo(targetMb);
+        PublishStats();
+        return;
+    }
     pendingTargetMb_.store(targetMb);
     requestResize_.store(true);
     if (budgetEvent_) SetEvent(budgetEvent_);
@@ -416,6 +449,7 @@ bool VramPool::SubmitAndWait()
 
 bool VramPool::EvictSlice(size_t index, double& totalMs)
 {
+    std::lock_guard<std::mutex> lock(opMutex_);
     Slice& slice = slices_[index];
     if (!slice.inVram) return true;
 
@@ -459,6 +493,7 @@ bool VramPool::EvictSlice(size_t index, double& totalMs)
 
 bool VramPool::RestoreSlice(size_t index, double& totalMs)
 {
+    std::lock_guard<std::mutex> lock(opMutex_);
     Slice& slice = slices_[index];
     if (slice.inVram) return true;
 
@@ -518,6 +553,7 @@ bool VramPool::StartMonitor()
 {
     stop_.store(false);
     monitor_ = std::thread(&VramPool::MonitorLoop, this);
+    monitorRunning_ = true;
     return true;
 }
 
@@ -526,6 +562,7 @@ void VramPool::StopMonitor()
     stop_.store(true);
     if (budgetEvent_) SetEvent(budgetEvent_);
     if (monitor_.joinable()) monitor_.join();
+    monitorRunning_ = false;
 }
 
 void VramPool::RequestEvictAll()
@@ -562,6 +599,21 @@ void VramPool::MonitorLoop()
             busy_.store(true);
             ResizeTo(pendingTargetMb_.load());
             busy_.store(false);
+        }
+
+        // CommitGuard: if the system commit reserve is being eaten (a game
+        // just loaded), give two slices back instead of waiting for WDDM to
+        // fail an allocation.
+        if (!slices_.empty()) {
+            const uint64_t freeCommit = FreeCommitMb();
+            if (freeCommit < kCommitPressureFloorMb) {
+                const uint32_t current = targetMb_.load();
+                const uint32_t reduced = current > 2048u ? current - 2048u : 1024u;
+                Log(L"[commit] pressure: free commit %llu MB, shrinking %u -> %u MB",
+                    (unsigned long long)freeCommit, current, reduced);
+                ResizeTo(reduced);
+                PublishStats();
+            }
         }
 
         if (requestEvict_.exchange(false)) {
@@ -659,6 +711,13 @@ void VramPool::PublishStats()
     uint64_t freeBytes = 0;
     stats.nvmlAvailable = QueryNvmlFree(freeBytes);
     stats.nvmlFreeBytes = freeBytes;
+    stats.fbTotalBytes = adapterVramBytes_;
+    stats.fbUsedBytes = adapterVramBytes_ > freeBytes ? adapterVramBytes_ - freeBytes : 0;
+    uint64_t bar1Used = 0, bar1Total = 0;
+    if (QueryNvmlBar1(bar1Used, bar1Total)) {
+        stats.bar1UsedBytes = bar1Used;
+        stats.bar1TotalBytes = bar1Total;
+    }
     stats.lastEvictMs = stats_.lastEvictMs;
     stats.lastRestoreMs = stats_.lastRestoreMs;
     stats.lastDmaMBps = lastDmaMBps_;
@@ -668,6 +727,157 @@ void VramPool::PublishStats()
 
     std::lock_guard<std::mutex> lock(statsMutex_);
     stats_ = stats;
+}
+
+uint32_t VramPool::SliceCount() const
+{
+    std::lock_guard<std::mutex> lock(statsMutex_);
+    return (uint32_t)stats_.sliceCount;
+}
+
+uint64_t VramPool::CryoCapacity() const
+{
+    return (uint64_t)SliceCount() * sliceBytes_;
+}
+
+void* VramPool::BeginSliceWrite(uint64_t offset, uint64_t bytes)
+{
+    if (!sliceBytes_ || bytes == 0) return nullptr;
+    const size_t index = (size_t)(offset / sliceBytes_);
+    const uint64_t local = offset % sliceBytes_;
+
+    if (!opMutex_.try_lock()) return nullptr;
+    if (index >= slices_.size()) {
+        opMutex_.unlock();
+        return nullptr;
+    }
+    Slice& slice = slices_[index];
+    if (!slice.resource || !slice.inVram || local + bytes > slice.size) {
+        opMutex_.unlock();
+        return nullptr;
+    }
+    if (!slice.mapped) {
+        if (FAILED(slice.resource->Map(0, nullptr, &slice.cpu))) {
+            opMutex_.unlock();
+            return nullptr;
+        }
+        slice.mapped = true;
+    }
+    writeOffset_ = offset;
+    return static_cast<uint8_t*>(slice.cpu) + local;
+}
+
+void VramPool::EndSliceWrite(uint64_t)
+{
+    // The mapping stays alive on purpose: re-mapping a 1 GB resource for every
+    // 64 MB chunk costs more than the copy itself. The slice is unmapped when
+    // it is evicted or on shutdown.
+    opMutex_.unlock();
+}
+
+bool VramPool::ReadCryoDma(uint64_t offset, uint64_t bytes, double& mbps)
+{
+    if (!sliceBytes_ || bytes == 0 || stageBytes_ == 0) return false;
+
+    std::lock_guard<std::mutex> lock(opMutex_);
+    const size_t index = (size_t)(offset / sliceBytes_);
+    const uint64_t local = offset % sliceBytes_;
+    if (index >= slices_.size()) return false;
+
+    Slice& slice = slices_[index];
+    if (!slice.resource || !slice.inVram) return false;
+
+    const uint64_t transfer = std::min(std::min(bytes, stageBytes_), slice.size - local);
+    if (transfer == 0) return false;
+
+    Timer timer;
+    timer.Begin();
+    if (!BeginList()) return false;
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = slice.resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list_->ResourceBarrier(1, &barrier);
+    list_->CopyBufferRegion(readStage_, 0, slice.resource, local, transfer);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    list_->ResourceBarrier(1, &barrier);
+
+    if (!SubmitAndWait()) return false;
+
+    const double ms = timer.Ms();
+    if (ms > 0.0) {
+        mbps = (double)transfer / (1024.0 * 1024.0) / (ms / 1000.0);
+        lastDmaMBps_ = mbps;
+        std::lock_guard<std::mutex> statsLock(statsMutex_);
+        stats_.lastDmaMBps = mbps;
+    }
+    return true;
+}
+
+// Egress for CryoRestore / torture test: copy engine reads GDDR6 into the
+// readback staging buffer, then the host gets a plain memcpy.
+bool VramPool::ReadCryoDmaInto(uint64_t offset, uint64_t bytes, void* dst,
+                               double& mbps)
+{
+    if (!dst || !sliceBytes_ || bytes == 0 || stageBytes_ == 0) return false;
+    if (bytes > stageBytes_) return false;
+
+    std::lock_guard<std::mutex> lock(opMutex_);
+    const size_t index = (size_t)(offset / sliceBytes_);
+    const uint64_t local = offset % sliceBytes_;
+    if (index >= slices_.size()) return false;
+
+    Slice& slice = slices_[index];
+    if (!slice.resource || !slice.inVram || local + bytes > slice.size) return false;
+
+    Timer timer;
+    timer.Begin();
+    if (!BeginList()) return false;
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = slice.resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list_->ResourceBarrier(1, &barrier);
+    list_->CopyBufferRegion(readStage_, 0, slice.resource, local, bytes);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    list_->ResourceBarrier(1, &barrier);
+
+    if (!SubmitAndWait()) return false;
+
+    std::memcpy(dst, readPtr_, (size_t)bytes);
+    const double ms = timer.Ms();
+    if (ms > 0.0) {
+        mbps = (double)bytes / (1024.0 * 1024.0) / (ms / 1000.0);
+        lastDmaMBps_ = mbps;
+        std::lock_guard<std::mutex> statsLock(statsMutex_);
+        stats_.lastDmaMBps = mbps;
+    }
+    return true;
+}
+
+void VramPool::LogSensors(const wchar_t* tag)
+{
+    uint64_t bar1Used = 0, bar1Total = 0;
+    const bool haveBar1 = QueryNvmlBar1(bar1Used, bar1Total);
+    uint64_t freeBytes = 0;
+    const bool haveFb = QueryNvmlFree(freeBytes);
+    uint64_t budget = 0, usage = 0;
+    QueryBudget(budget, usage);
+
+    Log(L"[sensor] %ls: nvml_fb=%llu MB nvml_bar1=%llu/%llu MB dxgi_local=%llu MB "
+        L"dma=%.1f MB/s",
+        tag, (unsigned long long)(haveFb ? (adapterVramBytes_ - freeBytes) / kMb : 0),
+        (unsigned long long)(haveBar1 ? bar1Used / kMb : 0),
+        (unsigned long long)(haveBar1 ? bar1Total / kMb : 0),
+        (unsigned long long)(usage / kMb), lastDmaMBps_);
 }
 
 PoolStats VramPool::GetStats() const

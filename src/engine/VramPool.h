@@ -26,6 +26,12 @@ struct PoolStats {
     uint64_t nvmlFreeBytes = 0;
     bool nvmlAvailable = false;
 
+    // Hardware sensors: framebuffer, BAR1 window and the DXGI local budget.
+    uint64_t fbUsedBytes = 0;
+    uint64_t fbTotalBytes = 0;
+    uint64_t bar1UsedBytes = 0;
+    uint64_t bar1TotalBytes = 0;
+
     double lastEvictMs = 0.0;
     double lastRestoreMs = 0.0;
     double lastDmaMBps = 0.0;
@@ -72,6 +78,22 @@ public:
     uint64_t TotalBytes() const { return totalBytes_; }
     void Log(const wchar_t* format, ...);
 
+    // CryoSwap hot-page cache: a linear byte space laid over the slices.
+    uint32_t SliceCount() const;
+    uint64_t SliceBytes() const { return sliceBytes_; }
+    uint64_t CryoCapacity() const;
+    // Maps one slice region for a streaming write. The pool lock stays held
+    // until EndSliceWrite, so the monitor thread cannot evict underneath.
+    void* BeginSliceWrite(uint64_t offset, uint64_t bytes);
+    void EndSliceWrite(uint64_t offset);
+    // Reads cached pages back through the copy engine; mbps gets the real
+    // transfer rate shown as "PCIe DMA".
+    bool ReadCryoDma(uint64_t offset, uint64_t bytes, double& mbps);
+    // Same, but lands in a host buffer (DMA -> readback staging -> memcpy).
+    bool ReadCryoDmaInto(uint64_t offset, uint64_t bytes, void* dst, double& mbps);
+    // One log line with framebuffer, BAR1, DXGI and DMA counters.
+    void LogSensors(const wchar_t* tag);
+
 private:
     bool CreateDevice();
     bool BeginList();
@@ -91,6 +113,7 @@ private:
     bool QueryBudget(uint64_t& budget, uint64_t& usage) const;
     bool QueryNvmlFree(uint64_t& freeBytes) const;
     bool QueryNvmlUtil(unsigned& percent) const;
+    bool QueryNvmlBar1(uint64_t& usedBytes, uint64_t& totalBytes) const;
 
     // D3D12
     ID3D12Device* device_ = nullptr;
@@ -110,6 +133,7 @@ private:
     void* nvmlDevice_ = nullptr;
     void* nvmlGetMemory_ = nullptr;
     void* nvmlGetUtil_ = nullptr;
+    void* nvmlGetBar1_ = nullptr;
 
     struct Slice {
         ID3D12Resource* resource = nullptr;
@@ -141,6 +165,7 @@ private:
 
     std::thread monitor_;
     std::atomic<bool> stop_{ false };
+    std::atomic<bool> monitorRunning_{ false };
     std::atomic<bool> requestEvict_{ false };
     std::atomic<bool> requestRestore_{ false };
     std::atomic<bool> requestResize_{ false };
@@ -151,5 +176,7 @@ private:
     bool shutdownDone_ = false;
 
     mutable std::mutex statsMutex_;
+    mutable std::mutex opMutex_;
+    uint64_t writeOffset_ = 0;
     PoolStats stats_;
 };

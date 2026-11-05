@@ -7,13 +7,15 @@
 #include <string>
 
 class VramPool;
+class CryoSwap;
 
 class MainWindow {
 public:
     MainWindow();
     ~MainWindow();
 
-    bool Create(HINSTANCE instance, VramPool* pool, const std::wstring& exePath);
+    bool Create(HINSTANCE instance, VramPool* pool, CryoSwap* cryo,
+                const std::wstring& exePath);
     void Show(int cmdShow);
     HWND Handle() const { return hwnd_; }
 
@@ -34,10 +36,13 @@ private:
     void CyclePool();
     uint32_t MaxPoolMb() const;
     std::wstring PoolCellText() const;
+    void RunCryoNow();
+    void ResetCryo();
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
     VramPool* pool_ = nullptr;
+    CryoSwap* cryo_ = nullptr;
     std::wstring exePath_;
 
     HFONT fontTitle_ = nullptr;
@@ -57,4 +62,6 @@ private:
     RECT minimizeRect_{};
     RECT autostartRect_{};
     RECT poolRect_{};
+    RECT cryoRunRect_{};
+    RECT cryoResetRect_{};
 };

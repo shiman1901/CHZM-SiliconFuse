@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "engine/CryoSwap.h"
 #include "engine/VramPool.h"
 
 #include <windowsx.h>
@@ -141,10 +142,12 @@ MainWindow::~MainWindow()
     if (iconLarge_) DestroyIcon(iconLarge_);
 }
 
-bool MainWindow::Create(HINSTANCE instance, VramPool* pool, const std::wstring& exePath)
+bool MainWindow::Create(HINSTANCE instance, VramPool* pool, CryoSwap* cryo,
+                        const std::wstring& exePath)
 {
     instance_ = instance;
     pool_ = pool;
+    cryo_ = cryo;
     exePath_ = exePath;
 
     WNDCLASSEXW wc{};
@@ -289,6 +292,21 @@ void MainWindow::TogglePower()
 
 void MainWindow::OnTimer()
 {
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::RunCryoNow()
+{
+    if (!cryo_) return;
+    cryo_->SetEnabled(true);
+    cryo_->RunCycle();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ResetCryo()
+{
+    if (!cryo_) return;
+    cryo_->Reset();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -548,6 +566,30 @@ void MainWindow::DrawScene(HDC dc, int width, int height)
 
     DrawRule(dc, pad, 312, width - pad, kRule);
 
+    // CryoSwap strip: live DDR4 savings, last wake latency, cache depth.
+    const int cryoY = 320;
+    const int pillH = 24;
+    cryoResetRect_ = RECT{ width - pad - 74, cryoY, width - pad, cryoY + pillH };
+    cryoRunRect_ = RECT{ cryoResetRect_.left - 92, cryoY,
+                         cryoResetRect_.left - 8, cryoY + pillH };
+
+    CryoStats cryoStats{};
+    if (cryo_) cryoStats = cryo_->GetStats();
+
+    wchar_t cryoText[160];
+    swprintf_s(cryoText, L"CRYO SAVED: %.1f GB DDR4  |  WAKE %.1f MS  |  FROZEN %d",
+               (double)cryoStats.savedBytes / (1024.0 * 1024.0 * 1024.0),
+               cryoStats.lastWakeMs, cryoStats.frozen);
+    DrawLabel(dc, fontMono_, cryoText,
+              RECT{ pad, cryoY, cryoRunRect_.left - 12, cryoY + pillH }, kDim);
+
+    DrawPanel(dc, cryoRunRect_, kPanel, Mix(kPanelBorder, kViolet, 45), 10);
+    DrawLabel(dc, fontMono_, L"RUN CRYO", cryoRunRect_, kViolet,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawPanel(dc, cryoResetRect_, kPanel, kPanelBorder, 10);
+    DrawLabel(dc, fontMono_, L"RESET", cryoResetRect_, kDim,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
     const int controlY = 356;
     const int controlH = 44;
 
@@ -628,6 +670,14 @@ LRESULT MainWindow::Dispatch(UINT msg, WPARAM wParam, LPARAM lParam)
         POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         if (PtInRect(&poolRect_, pt)) {
             CyclePool();
+            return 0;
+        }
+        if (PtInRect(&cryoRunRect_, pt)) {
+            RunCryoNow();
+            return 0;
+        }
+        if (PtInRect(&cryoResetRect_, pt)) {
+            ResetCryo();
             return 0;
         }
         if (PtInRect(&capsuleRect_, pt)) {

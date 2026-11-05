@@ -1,0 +1,82 @@
+﻿CHZM//SILICONFUSE  STAGE 7  TORTURE REPORT
+generated=2026-11-05 06:16:10
+mode=torture (512 MB proof)
+
+[TEST 1: BUILD + EMBEDDED ICON]
+  exe_path        = C:\Users\CHAZM\Desktop\CHZMINFINITYCORE\CHZM-SiliconFuse\build\CHZM_SiliconFuse.exe
+  exe_size_bytes  = 1014421
+  rt_group_icon   = PRESENT (id 1)
+
+[TEST 2: COMMITGUARD + VRAM POOL]
+  adapter_vram_mb = 11964
+  pool_mb         = 4096
+  slices          = 4 x 1024 MB
+  commit_free_mb  = 20898 (guard floor 6144)
+  commit_limit_mb = 36773
+  avx2_ingress_mbps = 10857.9 (5.89 ms for 64 MB)
+  dma_egress_mbps = 5686.7
+
+[TEST 3: 512 MB END-TO-END GDDR6 PROOF]
+  --- STEP 1 (BASELINE) ---
+  victim_pid      = 14000
+  victim_alloc_mb = 512 (MEM_COMMIT|MEM_PRIVATE)
+  victim_hash     = 17132522247078871939
+  victim_ws_mb    = 520.6
+  victim_commit_mb= 514.6
+  --- STEP 2 (INGRESS 512 MB -> GDDR6) ---
+  frozen          = 1
+  gddr6_bytes_mb  = 512
+  regions         = 12
+  threads_frozen  = 4
+  ingress_ms      = 533.87 (copy loop only)
+  freeze_total_ms = 631.46 (suspend + MEM_RESET + quota)
+  ingress_gbps    = 0.94
+  nvml_fb_used_mb = 5163
+  nvml_bar1_mb    = 16355 / 16384
+  dxgi_used_mb    = 4104
+  --- STEP 3 (EVICT + ZERO PHYSICAL DDR4) ---
+  zeroed_mb       = 512 (write succeeded=1)
+  mem_reset_undo  = NULL (must use GDDR6)
+  victim_ws_mb    = 23.9
+  victim_commit_mb= 514.6
+  avail_ram_before_mb = 10210
+  avail_ram_after_mb  = 10674
+  avail_ram_delta_mb  = 464
+  standby_purge   = unavailable
+  --- STEP 4 (EGRESS GDDR6 -> DMA -> WriteProcessMemory) ---
+  restored        = 1
+  egress_bytes_mb = 512
+  dma_regions     = 12
+  undo_regions    = 0
+  dma_peak_mbps   = 8042.6
+  checksum        = MATCH
+  restore_ms      = 901.81
+  --- STEP 5 (VICTIM SELF-VERIFICATION) ---
+  match_percent   = 100.0000%
+  bit_for_bit     = 100 percent HASH EQUAL
+  total_restore_ms= 901.81
+
+[TEST 4: COMMITGUARD]
+  free_commit_mb  = 20317
+  slice_allowed   = yes (above 6144 MB floor)
+  pressure_floor  = 3072 MB (auto-trim 2 slices)
+  resize_2048_mb  = 2 slices
+  resize_4096_mb  = 4 slices
+  commit_after_mb = 20830
+
+[TEST 5: STANDBY PURGE + 4 HARDWARE SENSORS]
+  avail_ram_mb    = 10863
+  purge_call      = unavailable (needs admin)
+  1_nvml_fb_used_mb  = 5163 / 11964
+  2_nvml_bar1_used_mb= 16355 / 16384
+  3_dxgi_local_used_mb = 4104
+  4_avx2_ingress_mbps  = 10857.9
+  4_gpu_dma_egress_mbps= 5686.7
+
+[TEST 6: ENGINE REGRESSION]
+  restore_unknown_pid_refused = 1
+  frozen_processes = 0
+  pool_after_tests_mb = 4096
+  free_commit_end_mb  = 20830
+
+RESULT: TORTURE TEST FINISHED

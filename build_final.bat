@@ -46,15 +46,19 @@ if errorlevel 1 (
 )
 
 "%GXX%" -std=c++20 -O2 -mavx2 -municode -Wl,--subsystem,windows -static -w ^
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 ^
     -I"%ROOT%\src" ^
     "%ROOT%\src\main.cpp" ^
     "%ROOT%\src\engine\VramPool.cpp" ^
     "%ROOT%\src\engine\StorageBridge.cpp" ^
     "%ROOT%\src\engine\PagingManager.cpp" ^
+    "%ROOT%\src\engine\CryoSwap.cpp" ^
+    "%ROOT%\src\engine\CommitGuard.cpp" ^
+    "%ROOT%\src\engine\StandbyPurge.cpp" ^
     "%ROOT%\src\gui\MainWindow.cpp" ^
     "%OUTDIR%\app_res.o" ^
     -o "%OUT%" ^
-    -ld3d12 -ldxgi -lole32 -lpsapi -lgdi32 -lmsimg32 -lshell32 -luser32 -ldwmapi
+    -ld3d12 -ldxgi -lole32 -luuid -lpsapi -lgdi32 -lmsimg32 -lshell32 -luser32 -ldwmapi
 
 if errorlevel 1 (
     echo [FAIL] Build failed.
