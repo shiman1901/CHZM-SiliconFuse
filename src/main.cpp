@@ -11,6 +11,7 @@
 
 #include "engine/CommitGuard.h"
 #include "engine/CryoSwap.h"
+#include "engine/Hash64.h"
 #include "engine/PagingManager.h"
 #include "engine/StandbyPurge.h"
 #include "engine/StorageBridge.h"
@@ -21,17 +22,8 @@ namespace {
 
 constexpr uint64_t kMb = 1024ull * 1024ull;
 constexpr uint64_t kVictimDefaultMb = 512;
+constexpr uint64_t kHashChunk = 16ull * kMb;
 
-uint64_t Fnv1a(uint64_t hash, const uint8_t* data, size_t bytes)
-{
-    for (size_t i = 0; i < bytes; ++i) {
-        hash ^= (uint64_t)data[i];
-        hash *= 1099511628211ull;
-    }
-    return hash;
-}
-
-// Deterministic test pattern: any surviving byte is verifiable.
 uint8_t PatternByte(uint64_t index) { return (uint8_t)((index * 167ull + 13ull) & 0xFF); }
 
 std::wstring LocalAppData()
@@ -64,9 +56,9 @@ std::wstring ReportPath()
 {
     const std::wstring docs = ExecutableDir() + L"\\..\\docs";
     if (GetFileAttributesW(docs.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return docs + L"\\STAGE7_TORTURE_REPORT.txt";
+        return docs + L"\\STAGE8_BENCHMARK_MATRIX.txt";
     }
-    return LocalAppData() + L"\\STAGE7_TORTURE_REPORT.txt";
+    return LocalAppData() + L"\\STAGE8_BENCHMARK_MATRIX.txt";
 }
 
 std::wstring VictimStatePath() { return LocalAppData() + L"\\victim_state.txt"; }
@@ -95,33 +87,83 @@ void Report(FILE* out, const wchar_t* format, ...)
     fflush(out);
 }
 
-double WorkingSetMb(DWORD pid)
+struct ProcNumbers {
+    double wsMb = -1.0;
+    double commitMb = -1.0;
+    uint64_t pageFaults = 0;
+};
+
+ProcNumbers ReadProcessNumbers(DWORD pid)
 {
+    ProcNumbers numbers;
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) return -1.0;
-    PROCESS_MEMORY_COUNTERS counters{};
-    const bool ok = GetProcessMemoryInfo(process, &counters, sizeof(counters)) != FALSE;
+    if (!process) return numbers;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (GetProcessMemoryInfo(process,
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        numbers.wsMb = (double)counters.WorkingSetSize / (1024.0 * 1024.0);
+        numbers.commitMb = (double)counters.PrivateUsage / (1024.0 * 1024.0);
+        numbers.pageFaults = counters.PageFaultCount;
+    }
     CloseHandle(process);
-    return ok ? (double)counters.WorkingSetSize / (1024.0 * 1024.0) : -1.0;
+    return numbers;
 }
 
-double PrivateCommitMb(DWORD pid)
+// Hashes a byte range of another process through ReadProcessMemory (AVX2 hash).
+bool HashRemoteRange(DWORD pid, uint64_t address, uint64_t bytes, uint64_t& hash,
+                     uint64_t& hashed)
 {
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) return -1.0;
-    PROCESS_MEMORY_COUNTERS_EX counters{};
-    const bool ok = GetProcessMemoryInfo(process,
-                                         reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                                         sizeof(counters)) != FALSE;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                                 FALSE, pid);
+    if (!process) return false;
+
+    std::vector<uint8_t> buffer((size_t)std::min(kHashChunk, bytes));
+    Hash64 hasher;
+    hashed = 0;
+    uint64_t offset = 0;
+    while (offset < bytes) {
+        const uint64_t chunk = std::min(bytes - offset, kHashChunk);
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(process,
+                               reinterpret_cast<const void*>(address + offset),
+                               buffer.data(), (SIZE_T)chunk, &read) || read == 0) {
+            CloseHandle(process);
+            return false;
+        }
+        hasher.Update(buffer.data(), (size_t)read);
+        hashed += read;
+        offset += read;
+    }
+    hash = hasher.Final();
     CloseHandle(process);
-    return ok ? (double)counters.PrivateUsage / (1024.0 * 1024.0) : -1.0;
+    return true;
+}
+
+bool TouchRemoteRange(DWORD pid, uint64_t address, uint64_t bytes)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                                 FALSE, pid);
+    if (!process) return false;
+    std::vector<uint8_t> buffer((size_t)std::min<uint64_t>(kHashChunk, bytes));
+    uint64_t offset = 0;
+    bool ok = true;
+    while (offset < bytes) {
+        const uint64_t chunk = std::min(bytes - offset, kHashChunk);
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(process, reinterpret_cast<const void*>(address + offset),
+                               buffer.data(), (SIZE_T)chunk, &read) || read == 0) {
+            ok = false;
+            break;
+        }
+        offset += read;
+    }
+    CloseHandle(process);
+    return ok;
 }
 
 // ---------------------------------------------------------------- victim ----
 
-// --cryo-victim [MB]: allocates private pages, fills them with the test
-// pattern and waits for the verification event. It stays in the foreground of
-// nothing, holds no window, so CryoSwap may touch it.
 int RunCryoVictim(const std::wstring& arguments)
 {
     uint64_t sizeMb = kVictimDefaultMb;
@@ -138,8 +180,7 @@ int RunCryoVictim(const std::wstring& arguments)
     if (!buffer) return 5;
 
     for (size_t i = 0; i < total; ++i) buffer[i] = PatternByte(i);
-    uint64_t hash = 1469598103934665603ull;
-    hash = Fnv1a(hash, buffer, total);
+    const uint64_t hash = Hash64::Compute(buffer, total);
 
     const std::wstring statePath = VictimStatePath();
     FILE* state = _wfsopen(statePath.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
@@ -151,23 +192,19 @@ int RunCryoVictim(const std::wstring& arguments)
         fclose(state);
     }
 
-    HANDLE verify = CreateEventW(nullptr, TRUE, FALSE, L"Global\\ChzmVictimVerify");
+    HANDLE verify = CreateEventW(nullptr, TRUE, FALSE, L"Global\\ChzmVictimVerify2");
     if (!verify) return 6;
 
-    const DWORD wait = WaitForSingleObject(verify, 180000);
-    if (wait != WAIT_OBJECT_0) return 7;
+    if (WaitForSingleObject(verify, 180000) != WAIT_OBJECT_0) return 7;
 
-    uint64_t after = 1469598103934665603ull;
-    after = Fnv1a(after, buffer, total);
-
+    const uint64_t after = Hash64::Compute(buffer, total);
     size_t matching = 0;
     for (size_t i = 0; i < total; ++i) {
         if (buffer[i] == PatternByte(i)) ++matching;
     }
     const double percent = 100.0 * (double)matching / (double)total;
 
-    const std::wstring resultPath = VictimResultPath();
-    FILE* result = _wfsopen(resultPath.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
+    FILE* result = _wfsopen(VictimResultPath().c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
     if (result) {
         fwprintf(result, L"match_percent=%.4f\n", percent);
         fwprintf(result, L"hash_original=%llu\n", (unsigned long long)hash);
@@ -205,36 +242,187 @@ bool ParseVictimState(VictimInfo& info)
     return ok && info.pid != 0;
 }
 
-bool ZeroVictimPages(DWORD pid, const std::vector<CachedProcess>& frozen,
-                     const std::vector<uint8_t>& zeros, uint64_t& zeroed)
+struct MatrixRow {
+    uint64_t sizeMb = 0;
+    // Mode A / B
+    double wsBefore = 0.0;
+    double commitMb = 0.0;
+    double wsAfterEmpty = 0.0;
+    uint64_t faultsBefore = 0;
+    uint64_t faultsAfterTouch = 0;
+    // Mode C
+    double freezeTotalMs = 0.0;
+    double suspendMs = 0.0;
+    double rpmMs = 0.0;
+    double vramMs = 0.0;
+    double trimMs = 0.0;
+    double freezeHashMs = 0.0;
+    double wsAfter = 0.0;
+    int64_t availDelta = 0;
+    double dmaMs = 0.0;
+    double hashMs = 0.0;
+    double wpmMs = 0.0;
+    double resumeMs = 0.0;
+    double restoreMs = 0.0;
+    double dmaMBps = 0.0;
+    uint64_t origHash = 0;
+    uint64_t zeroedHash = 0;
+    uint64_t restoredHash = 0;
+    uint64_t zeroedMb = 0;
+    int regions = 0;
+    bool bitMatch = false;
+    bool checksum = false;
+};
+
+bool RunOneSize(VramPool& pool, CryoSwap& cryo, uint64_t sizeMb, MatrixRow& row,
+                FILE* out)
 {
-    HANDLE process = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-                                     PROCESS_QUERY_LIMITED_INFORMATION,
-                                 FALSE, pid);
-    if (!process) return false;
-    zeroed = 0;
-    for (const CachedProcess& cached : frozen) {
-        if (cached.pid != pid) continue;
-        for (const CachedRegion& region : cached.regions) {
+    row.sizeMb = sizeMb;
+    DeleteFileW(VictimStatePath().c_str());
+    DeleteFileW(VictimResultPath().c_str());
+    HANDLE verify = CreateEventW(nullptr, TRUE, FALSE, L"Global\\ChzmVictimVerify2");
+    if (verify) ResetEvent(verify);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    std::wstring command = L"\"" + ExecutablePath() + L"\" --cryo-victim " +
+                           std::to_wstring(sizeMb);
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        nullptr, &startup, &child)) {
+        Report(out, L"  victim_spawn(size=%llu) = FAILED", (unsigned long long)sizeMb);
+        if (verify) CloseHandle(verify);
+        return false;
+    }
+
+    VictimInfo info;
+    for (int i = 0; i < 100 && !ParseVictimState(info); ++i) Sleep(100);
+    if (info.pid == 0) {
+        Report(out, L"  victim_state(size=%llu) = TIMEOUT", (unsigned long long)sizeMb);
+        TerminateProcess(child.hProcess, 0);
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+        if (verify) CloseHandle(verify);
+        return false;
+    }
+
+    const uint64_t rangeBytes = info.sizeMb * kMb;
+
+    // --- Mode A: baseline, hands off -------------------------------------
+    ProcNumbers before = ReadProcessNumbers(info.pid);
+    row.wsBefore = before.wsMb;
+    row.commitMb = before.commitMb;
+    row.faultsBefore = before.pageFaults;
+
+    // --- Mode B: plain EmptyWorkingSet -----------------------------------
+    HANDLE victim = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION,
+                                FALSE, info.pid);
+    if (victim) {
+        EmptyWorkingSet(victim);
+        CloseHandle(victim);
+    }
+    ProcNumbers afterEmpty = ReadProcessNumbers(info.pid);
+    row.wsAfterEmpty = afterEmpty.wsMb;
+
+    TouchRemoteRange(info.pid, info.base, rangeBytes);
+    ProcNumbers afterTouch = ReadProcessNumbers(info.pid);
+    row.faultsAfterTouch = afterTouch.pageFaults;
+
+    // --- Mode C: full CHZM cycle ----------------------------------------
+    uint64_t origHash = 0, origHashed = 0;
+    HashRemoteRange(info.pid, info.base, rangeBytes, origHash, origHashed);
+
+    const uint64_t availBefore = AvailablePhysicalMb();
+    FreezeResult freeze;
+    const bool frozen = cryo.CryoFreeze(info.pid, freeze);
+    row.freezeTotalMs = freeze.totalMs;
+    row.suspendMs = freeze.suspendMs;
+    row.rpmMs = freeze.rpmReadMs;
+    row.vramMs = freeze.vramWriteMs;
+    row.trimMs = freeze.resetTrimMs;
+    row.freezeHashMs = freeze.hashMs;
+    row.regions = freeze.regions;
+
+    // Zero the physical pages, then discard them again.
+    {
+        HANDLE process = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                                         PROCESS_QUERY_LIMITED_INFORMATION,
+                                     FALSE, info.pid);
+        if (process) {
+            std::vector<uint8_t> zeros((size_t)(16ull * kMb), 0);
             uint64_t offset = 0;
-            while (offset < region.size) {
-                const uint64_t chunk = (uint64_t)zeros.size() < region.size - offset
-                                           ? (uint64_t)zeros.size()
-                                           : region.size - offset;
+            while (offset < rangeBytes) {
+                const uint64_t chunk = std::min(rangeBytes - offset,
+                                                (uint64_t)zeros.size());
                 SIZE_T wrote = 0;
                 if (!WriteProcessMemory(process,
-                                        reinterpret_cast<void*>(region.address + offset),
-                                        zeros.data(), (SIZE_T)chunk, &wrote)) {
-                    CloseHandle(process);
-                    return false;
+                                        reinterpret_cast<void*>(info.base + offset),
+                                        zeros.data(), (SIZE_T)chunk, &wrote) ||
+                    wrote == 0) {
+                    break;
                 }
-                zeroed += wrote;
                 offset += wrote;
-                if (wrote == 0) break;
             }
+            VirtualAllocEx(process, reinterpret_cast<void*>(info.base),
+                           (SIZE_T)rangeBytes, MEM_RESET, PAGE_READWRITE);
+            SetProcessWorkingSetSizeEx(process, 4ull * kMb, 24ull * kMb,
+                                       QUOTA_LIMITS_HARDWS_MAX_ENABLE);
+            EmptyWorkingSet(process);
+            row.zeroedMb = offset / kMb;
+            CloseHandle(process);
         }
     }
-    CloseHandle(process);
+    PurgeLowPriorityStandbyList();
+
+    ProcNumbers afterZero = ReadProcessNumbers(info.pid);
+    row.wsAfter = afterZero.wsMb;
+    row.availDelta = (int64_t)AvailablePhysicalMb() - (int64_t)availBefore;
+
+    uint64_t zeroedHash = 0, zeroedHashed = 0;
+    HashRemoteRange(info.pid, info.base, rangeBytes, zeroedHash, zeroedHashed);
+    row.zeroedHash = zeroedHash;
+
+    RestoreResult restore;
+    const bool restored = cryo.CryoRestore(info.pid, true, restore);
+    row.dmaMs = restore.dmaGpuMs;
+    row.hashMs = restore.hashVerifyMs;
+    row.wpmMs = restore.wpmWriteMs;
+    row.resumeMs = restore.resumeMs;
+    row.restoreMs = restore.totalMs;
+    row.dmaMBps = restore.dmaMBps;
+    row.checksum = restore.checksumOk;
+
+    uint64_t restoredHash = 0, restoredHashed = 0;
+    HashRemoteRange(info.pid, info.base, rangeBytes, restoredHash, restoredHashed);
+
+    if (verify) SetEvent(verify);
+    for (int i = 0; i < 200 && GetFileAttributesW(VictimResultPath().c_str()) ==
+                                 INVALID_FILE_ATTRIBUTES; ++i) {
+        Sleep(50);
+    }
+    bool hashEqual = false;
+    FILE* result = _wfsopen(VictimResultPath().c_str(), L"r, ccs=UTF-8", _SH_DENYNO);
+    if (result) {
+        wchar_t line[256];
+        while (fgetws(line, 256, result)) {
+            unsigned long long value = 0;
+            if (swscanf_s(line, L"hash_equal=%llu", &value) == 1) hashEqual = value != 0;
+        }
+        fclose(result);
+    }
+
+    row.origHash = origHash;
+    row.restoredHash = restoredHash;
+    row.bitMatch = hashEqual && restoredHash == origHash && zeroedHash != origHash;
+
+    if (verify) CloseHandle(verify);
+    TerminateProcess(child.hProcess, 0);
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+
+    pool.LogSensors(L"matrix-run");
+    (void)frozen;
+    (void)restored;
     return true;
 }
 
@@ -244,12 +432,12 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
     FILE* out = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
     if (!out) return 6;
 
-    Report(out, L"CHZM//SILICONFUSE  STAGE 7  TORTURE REPORT");
     SYSTEMTIME now{};
     GetLocalTime(&now);
+    Report(out, L"CHZM//SILICONFUSE  STAGE 8  BENCHMARK MATRIX");
     Report(out, L"generated=%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth,
            now.wDay, now.wHour, now.wMinute, now.wSecond);
-    Report(out, L"mode=%ls", full ? L"torture (512 MB proof)" : L"self-test (quick)");
+    Report(out, L"mode=%ls", full ? L"torture (matrix 64/128/256/512 MB)" : L"quick");
     Report(out, L"");
 
     // ---------------------------------------------------------- TEST 1 -----
@@ -262,239 +450,149 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
     const uint64_t exeBytes = ((uint64_t)fileInfo.nFileSizeHigh << 32) | fileInfo.nFileSizeLow;
 
     Report(out, L"[TEST 1: BUILD + EMBEDDED ICON]");
-    Report(out, L"  exe_path        = %ls", exePath);
     Report(out, L"  exe_size_bytes  = %llu", (unsigned long long)exeBytes);
     Report(out, L"  rt_group_icon   = %ls", iconGroup ? L"PRESENT (id 1)" : L"MISSING");
     Report(out, L"");
 
     // ---------------------------------------------------------- TEST 2 -----
     PoolStats stats = pool.GetStats();
-    Report(out, L"[TEST 2: COMMITGUARD + VRAM POOL]");
+    Report(out, L"[TEST 2: POOL + COMMITGUARD + RAW BANDWIDTH]");
     Report(out, L"  adapter_vram_mb = %llu", (unsigned long long)(stats.adapterVramBytes / kMb));
     Report(out, L"  pool_mb         = %llu", (unsigned long long)(stats.poolBytes / kMb));
     Report(out, L"  slices          = %d x %llu MB", stats.sliceCount,
            (unsigned long long)(pool.SliceBytes() / kMb));
     Report(out, L"  commit_free_mb  = %llu (guard floor %llu)",
            (unsigned long long)FreeCommitMb(), (unsigned long long)kCommitGuardFloorMb);
-    Report(out, L"  commit_limit_mb = %llu", (unsigned long long)TotalCommitLimitMb());
 
     std::vector<uint8_t> bench((size_t)(64ull * kMb), 0x5A);
     Timer benchTimer;
     benchTimer.Begin();
     const bool streamOk = cryo.StreamWrite(0, bench.data(), bench.size());
     const double streamMs = benchTimer.Ms();
-    const double streamMbps =
-        streamOk && streamMs > 0.0
-            ? (double)bench.size() / (1024.0 * 1024.0) / (streamMs / 1000.0) : 0.0;
-    Report(out, L"  avx2_ingress_mbps = %.1f (%.2f ms for 64 MB)", streamMbps, streamMs);
+    const double streamMbps = streamOk && streamMs > 0.0
+                                  ? (double)bench.size() / (1024.0 * 1024.0) /
+                                        (streamMs / 1000.0)
+                                  : 0.0;
+    Report(out, L"  avx2_vram_write_mbps = %.1f (%.2f ms / 64 MB)", streamMbps, streamMs);
 
     double dmaMbps = 0.0;
     const bool dmaOk = pool.ReadCryoDmaInto(0, 64ull * kMb, bench.data(), dmaMbps);
-    Report(out, dmaOk ? L"  dma_egress_mbps = %.1f" : L"  dma_egress_mbps = FAILED",
+    Report(out, dmaOk ? L"  gpu_dma_read_mbps = %.1f" : L"  gpu_dma_read_mbps = FAILED",
            dmaOk ? dmaMbps : 0.0);
+
+    benchTimer.Begin();
+    const uint64_t hash64 = Hash64::Compute(bench.data(), bench.size());
+    const double hashMs = benchTimer.Ms();
+    Report(out, L"  avx2_hash_ms_64mb = %.2f (%.1f GB/s, hash=%llu)", hashMs,
+           hashMs > 0.0 ? (double)bench.size() / (1024.0 * 1024.0 * 1024.0) /
+                              (hashMs / 1000.0)
+                        : 0.0,
+           (unsigned long long)hash64);
+    Report(out, L"  projected_512mb_hash_ms = %.2f", hashMs * 8.0);
     Report(out, L"");
 
-    // ---------------------------------------------------------- TEST 3 -----
-    DWORD victimPid = 0;
-    double victimRestoreMs = 0.0;
-    double victimMatch = 0.0;
-    bool victimHashEqual = false;
-
+    // ---------------------------------------------------------- TEST 3-5 ---
+    std::vector<MatrixRow> rows;
     if (full) {
-        DeleteFileW(VictimStatePath().c_str());
-        DeleteFileW(VictimResultPath().c_str());
-        HANDLE verify = CreateEventW(nullptr, TRUE, FALSE, L"Global\\ChzmVictimVerify");
-        if (verify) ResetEvent(verify);
-
-        STARTUPINFOW startup{};
-        startup.cb = sizeof(startup);
-        PROCESS_INFORMATION child{};
-        std::wstring command = L"\"" + ExecutablePath() + L"\" --cryo-victim 512";
-        Report(out, L"[TEST 3: 512 MB END-TO-END GDDR6 PROOF]");
-
-        if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0,
-                            nullptr, nullptr, &startup, &child)) {
-            Report(out, L"  victim_spawn = FAILED");
-        } else {
-            VictimInfo info;
-            for (int i = 0; i < 100 && !ParseVictimState(info); ++i) Sleep(100);
-            victimPid = info.pid;
-            Report(out, L"  --- STEP 1 (BASELINE) ---");
-            Report(out, L"  victim_pid      = %lu", (unsigned long)info.pid);
-            Report(out, L"  victim_alloc_mb = %llu (MEM_COMMIT|MEM_PRIVATE)", (unsigned long long)info.sizeMb);
-            Report(out, L"  victim_hash     = %llu", (unsigned long long)info.hash);
-            Report(out, L"  victim_ws_mb    = %.1f", WorkingSetMb(info.pid));
-            Report(out, L"  victim_commit_mb= %.1f", PrivateCommitMb(info.pid));
-
-            const uint64_t availBefore = AvailablePhysicalMb();
-            const uint64_t availBeforeFreeze = availBefore;
-
-            Timer freezeTimer;
-            freezeTimer.Begin();
-            FreezeResult freeze;
-            const bool frozen = cryo.CryoFreeze(info.pid, freeze);
-
-            Report(out, L"  --- STEP 2 (INGRESS 512 MB -> GDDR6) ---");
-            Report(out, L"  frozen          = %d", frozen ? 1 : 0);
-            Report(out, L"  gddr6_bytes_mb  = %llu", (unsigned long long)(freeze.bytes / kMb));
-            Report(out, L"  regions         = %d", freeze.regions);
-            Report(out, L"  threads_frozen  = %d", freeze.threads);
-            Report(out, L"  ingress_ms      = %.2f (copy loop only)", freeze.ingressMs);
-            Report(out, L"  freeze_total_ms = %.2f (suspend + MEM_RESET + quota)",
-                   freeze.totalMs);
-            Report(out, L"  ingress_gbps    = %.2f",
-                   freeze.ingressMs > 0.0
-                       ? (double)freeze.bytes / (1024.0 * 1024.0 * 1024.0) /
-                             (freeze.ingressMs / 1000.0)
-                       : 0.0);
-            pool.LogSensors(L"after-ingress");
-            PoolStats afterIngress = pool.GetStats();
-            Report(out, L"  nvml_fb_used_mb = %llu", (unsigned long long)(afterIngress.fbUsedBytes / kMb));
-            Report(out, L"  nvml_bar1_mb    = %llu / %llu",
-                   (unsigned long long)(afterIngress.bar1UsedBytes / kMb),
-                   (unsigned long long)(afterIngress.bar1TotalBytes / kMb));
-            Report(out, L"  dxgi_used_mb    = %llu", (unsigned long long)(afterIngress.usageBytes / kMb));
-
-            // STEP 3: prove nothing survives in DDR4 or pagefile.
-            Report(out, L"  --- STEP 3 (EVICT + ZERO PHYSICAL DDR4) ---");
-            std::vector<uint8_t> zeros((size_t)(16ull * kMb), 0);
-            uint64_t zeroed = 0;
-            const bool zeroOk = ZeroVictimPages(info.pid, cryo.SnapshotFrozen(), zeros, zeroed);
-            Report(out, L"  zeroed_mb       = %llu (write succeeded=%d)",
-                   (unsigned long long)(zeroed / kMb), zeroOk ? 1 : 0);
-
-            // MEM_RESET_UNDO sub-test: with the pages overwritten and discarded
-            // there is nothing left to recover.
-            HANDLE victimHandle = OpenProcess(PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION,
-                                              FALSE, info.pid);
-            bool undoOk = false;
-            if (victimHandle) {
-                std::vector<CachedProcess> snapshot = cryo.SnapshotFrozen();
-                for (const CachedProcess& cached : snapshot) {
-                    if (cached.pid != info.pid || cached.regions.empty()) continue;
-                    void* undone = VirtualAllocEx(
-                        victimHandle,
-                        reinterpret_cast<void*>(cached.regions.front().address),
-                        (SIZE_T)cached.regions.front().size, MEM_RESET_UNDO, PAGE_READWRITE);
-                    undoOk = undone != nullptr;
-                    break;
-                }
-                CloseHandle(victimHandle);
-            }
-            Report(out, L"  mem_reset_undo  = %ls", undoOk ? L"RESTORED (page survived)" : L"NULL (must use GDDR6)");
-
-            const uint64_t availAfterZero = AvailablePhysicalMb();
-            Report(out, L"  victim_ws_mb    = %.1f", WorkingSetMb(info.pid));
-            Report(out, L"  victim_commit_mb= %.1f", PrivateCommitMb(info.pid));
-            Report(out, L"  avail_ram_before_mb = %llu", (unsigned long long)availBeforeFreeze);
-            Report(out, L"  avail_ram_after_mb  = %llu", (unsigned long long)availAfterZero);
-            Report(out, L"  avail_ram_delta_mb  = %lld",
-                   (long long)availAfterZero - (long long)availBeforeFreeze);
-
-            const bool purged = PurgeLowPriorityStandbyList();
-            Report(out, L"  standby_purge   = %ls", purged ? L"ok" : L"unavailable");
-
-            // STEP 4: honest egress through the copy engine.
-            Report(out, L"  --- STEP 4 (EGRESS GDDR6 -> DMA -> WriteProcessMemory) ---");
-            RestoreResult restore;
-            const bool restored = cryo.CryoRestore(info.pid, true, restore);
-            victimRestoreMs = restore.totalMs;
-            Report(out, L"  restored        = %d", restored ? 1 : 0);
-            Report(out, L"  egress_bytes_mb = %llu", (unsigned long long)(restore.bytes / kMb));
-            Report(out, L"  dma_regions     = %d", restore.dmaRegions);
-            Report(out, L"  undo_regions    = %d", restore.undoRegions);
-            Report(out, L"  dma_peak_mbps   = %.1f", restore.dmaMBps);
-            Report(out, L"  checksum        = %ls", restore.checksumOk ? L"MATCH" : L"MISMATCH");
-            Report(out, L"  restore_ms      = %.2f", restore.totalMs);
-            pool.LogSensors(L"after-egress");
-
-            // STEP 5: the victim verifies itself.
-            if (verify) SetEvent(verify);
-            for (int i = 0; i < 200 && GetFileAttributesW(VictimResultPath().c_str()) ==
-                                         INVALID_FILE_ATTRIBUTES; ++i) {
-                Sleep(50);
-            }
-            FILE* result = _wfsopen(VictimResultPath().c_str(), L"r, ccs=UTF-8", _SH_DENYNO);
-            if (result) {
-                wchar_t line[256];
-                while (fgetws(line, 256, result)) {
-                    double percent = 0.0;
-                    unsigned long long value = 0;
-                    if (swscanf_s(line, L"match_percent=%lf", &percent) == 1) victimMatch = percent;
-                    if (swscanf_s(line, L"hash_equal=%llu", &value) == 1) victimHashEqual = value != 0;
-                }
-                fclose(result);
-            }
-
-            Report(out, L"  --- STEP 5 (VICTIM SELF-VERIFICATION) ---");
-            Report(out, L"  match_percent   = %.4f%%", victimMatch);
-            Report(out, L"  bit_for_bit     = %ls", victimHashEqual ? L"100 percent HASH EQUAL" : L"HASH DIFFERS");
-            Report(out, L"  total_restore_ms= %.2f", victimRestoreMs);
-
-            if (verify) CloseHandle(verify);
-            TerminateProcess(child.hProcess, 0);
-            CloseHandle(child.hThread);
-            CloseHandle(child.hProcess);
+        const uint64_t sizes[] = { 64, 128, 256, 512 };
+        for (uint64_t sizeMb : sizes) {
+            MatrixRow row;
+            if (RunOneSize(pool, cryo, sizeMb, row, out)) rows.push_back(row);
         }
-    } else {
-        Report(out, L"[TEST 3: SKIPPED (run --torture-test for the 512 MB proof)]");
+    }
+
+    Report(out, L"[TEST 3: MODE A — BASELINE WINDOWS (no intervention)]");
+    Report(out, L"  Size_MB | WS_Before_MB | PrivateCommit_MB | Saved_RAM_MB");
+    Report(out, L"  --------+--------------+------------------+-------------");
+    for (const MatrixRow& row : rows) {
+        Report(out, L"  %7llu | %12.1f | %16.1f | %12d",
+               (unsigned long long)row.sizeMb, row.wsBefore, row.commitMb, 0);
     }
     Report(out, L"");
 
-    // ---------------------------------------------------------- TEST 4 -----
-    Report(out, L"[TEST 4: COMMITGUARD]");
-    const uint64_t commitFree = FreeCommitMb();
-    Report(out, L"  free_commit_mb  = %llu", (unsigned long long)commitFree);
-    Report(out, L"  slice_allowed   = %ls",
-           commitFree >= kCommitGuardFloorMb ? L"yes (above 6144 MB floor)" : L"refused");
-    Report(out, L"  pressure_floor  = %llu MB (auto-trim 2 slices)", (unsigned long long)kCommitPressureFloorMb);
-
-    // Exercise the resize path so CommitGuard is evaluated for every slice.
-    pool.RequestResize(2048);
-    Sleep(400);
-    const PoolStats resizedDown = pool.GetStats();
-    pool.RequestResize(4096);
-    Sleep(600);
-    PoolStats resizedUp = pool.GetStats();
-    Report(out, L"  resize_2048_mb  = %d slices", resizedDown.sliceCount);
-    Report(out, L"  resize_4096_mb  = %d slices", resizedUp.sliceCount);
-    Report(out, L"  commit_after_mb = %llu", (unsigned long long)FreeCommitMb());
+    Report(out, L"[TEST 4: MODE B — PLAIN EmptyWorkingSet (no GDDR6)]");
+    Report(out, L"  Size_MB | WS_Before_MB | WS_After_MB | PageFaults_Before | "
+                L"PageFaults_After_Touch | Fault_Delta");
+    Report(out, L"  --------+--------------+-------------+-------------------+"
+                L"------------------------+------------");
+    for (const MatrixRow& row : rows) {
+        Report(out, L"  %7llu | %12.1f | %11.1f | %17llu | %22llu | %11lld",
+               (unsigned long long)row.sizeMb, row.wsBefore, row.wsAfterEmpty,
+               (unsigned long long)row.faultsBefore,
+               (unsigned long long)row.faultsAfterTouch,
+               (long long)row.faultsAfterTouch - (long long)row.faultsBefore);
+    }
     Report(out, L"");
 
-    // ---------------------------------------------------------- TEST 5 -----
-    Report(out, L"[TEST 5: STANDBY PURGE + 4 HARDWARE SENSORS]");
-    const uint64_t available = AvailablePhysicalMb();
-    const bool purgeOk = PurgeLowPriorityStandbyList();
-    Report(out, L"  avail_ram_mb    = %llu", (unsigned long long)available);
-    Report(out, L"  purge_call      = %ls", purgeOk ? L"STATUS_SUCCESS" : L"unavailable (needs admin)");
-    PoolStats sensors = pool.GetStats();
-    Report(out, L"  1_nvml_fb_used_mb  = %llu / %llu",
-           (unsigned long long)(sensors.fbUsedBytes / kMb),
-           (unsigned long long)(sensors.fbTotalBytes / kMb));
-    Report(out, L"  2_nvml_bar1_used_mb= %llu / %llu",
-           (unsigned long long)(sensors.bar1UsedBytes / kMb),
-           (unsigned long long)(sensors.bar1TotalBytes / kMb));
-    Report(out, L"  3_dxgi_local_used_mb = %llu",
-           (unsigned long long)(sensors.usageBytes / kMb));
-    Report(out, L"  4_avx2_ingress_mbps  = %.1f", streamMbps);
-    Report(out, L"  4_gpu_dma_egress_mbps= %.1f", dmaMbps);
+    Report(out, L"[TEST 5: MODE C — CHZM CRYOSWAP GDDR6]");
+    Report(out, L"  Size_MB | WS_Before | WS_After | AvailRAM_Delta | DMA_ms | Hash_ms | "
+                L"WPM_ms | Total_Restore_ms | BitMatch");
+    Report(out, L"  --------+-----------+----------+----------------+--------+---------+"
+                L"--------+------------------+---------");
+    for (const MatrixRow& row : rows) {
+        Report(out, L"  %7llu | %9.1f | %8.1f | %14lld | %6.1f | %7.2f | %6.1f | "
+                    L"%16.2f | %ls",
+               (unsigned long long)row.sizeMb, row.wsBefore, row.wsAfter,
+               (long long)row.availDelta, row.dmaMs, row.hashMs, row.wpmMs,
+               row.restoreMs, row.bitMatch ? L"100%" : L"FAIL");
+    }
     Report(out, L"");
+
+    for (const MatrixRow& row : rows) {
+        Report(out, L"  --- SIZE %llu MB ---", (unsigned long long)row.sizeMb);
+        Report(out, L"  freeze_total_ms = %.2f (suspend %.2f | rpm %.2f | avx2_vram %.2f | "
+                    L"hash %.2f | trim %.2f)",
+               row.freezeTotalMs, row.suspendMs, row.rpmMs, row.vramMs,
+               row.freezeHashMs, row.trimMs);
+        Report(out, L"  restore_total_ms= %.2f (dma %.2f | hash %.2f | wpm %.2f | resume %.2f)",
+               row.restoreMs, row.dmaMs, row.hashMs, row.wpmMs, row.resumeMs);
+        Report(out, L"  regions         = %d | dma_peak_mbps = %.1f", row.regions, row.dmaMBps);
+        Report(out, L"  zeroed_mb       = %llu", (unsigned long long)row.zeroedMb);
+        Report(out, L"  orig_hash       = %llu", (unsigned long long)row.origHash);
+        Report(out, L"  zeroed_hash     = %llu (differs=%d)", (unsigned long long)row.zeroedHash,
+               row.zeroedHash != row.origHash ? 1 : 0);
+        Report(out, L"  restored_hash   = %llu (equal=%d)", (unsigned long long)row.restoredHash,
+               row.restoredHash == row.origHash ? 1 : 0);
+        Report(out, L"  gddr6_checksum  = %ls", row.checksum ? L"MATCH" : L"MISMATCH");
+        Report(out, L"");
+    }
 
     // ---------------------------------------------------------- TEST 6 -----
-    Report(out, L"[TEST 6: ENGINE REGRESSION]");
-    RestoreResult none;
-    const bool notFrozen = !cryo.CryoRestore(0xFFFFFFFF, false, none);
-    Report(out, L"  restore_unknown_pid_refused = %d", notFrozen ? 1 : 0);
-    const int frozenNow = cryo.GetStats().frozen;
-    Report(out, L"  frozen_processes = %d", frozenNow);
-    Report(out, L"  pool_after_tests_mb = %llu",
-           (unsigned long long)(pool.GetStats().poolBytes / kMb));
-    Report(out, L"  free_commit_end_mb  = %llu", (unsigned long long)FreeCommitMb());
+    Report(out, L"[TEST 6: COMMITGUARD]");
+    const uint64_t commitFree = FreeCommitMb();
+    Report(out, L"  free_commit_mb  = %llu (floor %llu)", (unsigned long long)commitFree,
+           (unsigned long long)kCommitGuardFloorMb);
+    pool.RequestResize(2048);
+    Sleep(300);
+    const int downSlices = pool.GetStats().sliceCount;
+    pool.RequestResize(4096);
+    Sleep(500);
+    const int upSlices = pool.GetStats().sliceCount;
+    Report(out, L"  resize_2048_mb  = %d slices", downSlices);
+    Report(out, L"  resize_4096_mb  = %d slices", upSlices);
     Report(out, L"");
-    Report(out, L"RESULT: %ls", L"TORTURE TEST FINISHED");
+
+    // ---------------------------------------------------------- TEST 7 -----
+    Report(out, L"[TEST 7: SENSORS + STANDBY PURGE]");
+    PoolStats sensors = pool.GetStats();
+    const bool purgeOk = PurgeLowPriorityStandbyList();
+    Report(out, L"  nvml_fb_used_mb   = %llu / %llu",
+           (unsigned long long)(sensors.fbUsedBytes / kMb),
+           (unsigned long long)(sensors.fbTotalBytes / kMb));
+    Report(out, L"  nvml_bar1_used_mb = %llu / %llu",
+           (unsigned long long)(sensors.bar1UsedBytes / kMb),
+           (unsigned long long)(sensors.bar1TotalBytes / kMb));
+    Report(out, L"  dxgi_local_used_mb= %llu", (unsigned long long)(sensors.usageBytes / kMb));
+    Report(out, L"  standby_purge     = %ls", purgeOk ? L"ok" : L"unavailable (needs admin)");
+    Report(out, L"  frozen_processes  = %d", cryo.GetStats().frozen);
+    Report(out, L"  pool_end_mb       = %llu",
+           (unsigned long long)(pool.GetStats().poolBytes / kMb));
+    Report(out, L"  free_commit_end_mb= %llu", (unsigned long long)FreeCommitMb());
+    Report(out, L"");
+    Report(out, L"RESULT: %ls", L"STAGE 8 MATRIX FINISHED");
 
     fclose(out);
-    pool.Log(L"[torture] report written to %ls", path.c_str());
+    pool.Log(L"[torture] stage 8 report written to %ls", path.c_str());
     return 0;
 }
 

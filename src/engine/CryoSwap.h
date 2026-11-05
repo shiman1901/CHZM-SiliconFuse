@@ -29,20 +29,37 @@ struct FreezeResult {
     uint64_t bytes = 0;        // bytes pushed into GDDR6
     uint64_t wsBefore = 0;
     uint64_t wsAfter = 0;
-    double ingressMs = 0.0;    // copy loop only
-    double totalMs = 0.0;      // whole freeze (suspend, MEM_RESET, quota)
     int regions = 0;
     int threads = 0;
+
+    // Sub-timers (ms).
+    double suspendMs = 0.0;     // NtSuspendProcess + thread snapshot check
+    double rpmReadMs = 0.0;     // ReadProcessMemory
+    double vramWriteMs = 0.0;   // AVX2 streaming into BAR1
+    double resetTrimMs = 0.0;   // MEM_RESET + HARDWS quota + EmptyWorkingSet
+    double hashMs = 0.0;        // checksum of the copied pages
+    double ingressMs = 0.0;     // rpmReadMs + vramWriteMs + hashMs
+    double totalMs = 0.0;
+
+    uint64_t origHash = 0;      // combined checksum of all cached regions
 };
 
 struct RestoreResult {
     bool ok = false;
     uint64_t bytes = 0;
-    double totalMs = 0.0;
     double dmaMBps = 0.0;
     int dmaRegions = 0;
     int undoRegions = 0;
     bool checksumOk = true;
+
+    // Sub-timers (ms).
+    double dmaGpuMs = 0.0;      // copy engine + fence wait
+    double hashVerifyMs = 0.0;  // checksum of the DMA'd pages
+    double wpmWriteMs = 0.0;    // WriteProcessMemory
+    double resumeMs = 0.0;      // quota release + NtResumeProcess
+    double totalMs = 0.0;
+
+    uint64_t restoredHash = 0;
 };
 
 struct CryoStats {

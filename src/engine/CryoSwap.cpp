@@ -3,6 +3,7 @@
 #include "CryoSwap.h"
 
 #include "CommitGuard.h"
+#include "Hash64.h"
 #include "StandbyPurge.h"
 #include "VramPool.h"
 
@@ -30,7 +31,7 @@ namespace {
 constexpr uint64_t kMb = 1024ull * 1024ull;
 
 constexpr uint64_t kMinWorkingSet = 100ull * kMb;
-constexpr uint64_t kMaxFreezePerProcess = 512ull * kMb;
+constexpr uint64_t kMaxFreezePerProcess = 1024ull * kMb;
 constexpr uint64_t kChunk = 64ull * kMb;
 constexpr uint64_t kMinRegionBytes = 4ull * 1024;
 constexpr int kMaxFreezePerCycle = 8;
@@ -229,13 +230,14 @@ void ApplyEcoQos(HANDLE process, bool on)
     SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
 }
 
-uint64_t Fnv1a(uint64_t hash, const uint8_t* data, size_t bytes)
+// Checksum of the per-region hashes, so a whole process has one fingerprint.
+uint64_t CombineHashes(const std::vector<uint64_t>& hashes)
 {
-    for (size_t i = 0; i < bytes; ++i) {
-        hash ^= (uint64_t)data[i];
-        hash *= 1099511628211ull;
+    Hash64 hasher;
+    for (uint64_t value : hashes) {
+        hasher.Update(&value, sizeof(value));
     }
-    return hash;
+    return hasher.Final();
 }
 
 void StreamToVram(void* dst, const void* src, size_t bytes)
@@ -393,12 +395,15 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     result.wsBefore = counters.WorkingSetSize;
 
     const int threadsBefore = CountThreads(pid);
+    Timer suspendTimer;
+    suspendTimer.Begin();
     if (threadsBefore <= 0 || !SuspendProcess(process)) {
         CloseHandle(process);
         return false;
     }
     Sleep(8);
     const int threadsAfter = CountThreads(pid);
+    result.suspendMs = suspendTimer.Ms();
     result.threads = threadsAfter;
     if (threadsAfter != threadsBefore) {
         Log(L"[cryo] pid=%lu thread list unstable (%d -> %d), aborting",
@@ -438,46 +443,60 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     }
 
     // Ingress: RAM -> GDDR6 through the WC-mapped slices (AVX2 streaming),
-    // round-robin per chunk across the slices.
+    // round-robin per chunk across the slices. Every stage is timed.
     std::vector<uint8_t> bounce((size_t)kChunk);
     uint64_t written = 0;
+    std::vector<uint64_t> regionHashes;
     bool ingressOk = true;
-    Timer ingressTimer;
-    ingressTimer.Begin();
+    Timer stepTimer;
     for (CachedRegion& region : regions) {
-        uint64_t hash = 1469598103934665603ull;
+        Hash64 regionHash;
         uint64_t offset = 0;
         while (offset < region.size) {
             const uint64_t chunk = std::min(region.size - offset, (uint64_t)kChunk);
-            SIZE_T read = 0;
-            if (!ReadProcessMemory(process,
-                                   reinterpret_cast<const void*>(region.address + offset),
-                                   bounce.data(), (SIZE_T)chunk, &read) || read == 0) {
-                ingressOk = false;
-                break;
-            }
-            hash = Fnv1a(hash, bounce.data(), (size_t)read);
 
-            uint64_t vramOffset = 0;
-            if (!PlaceChunk((uint32_t)read, vramOffset) ||
-                !StreamWrite(vramOffset, bounce.data(), (size_t)read)) {
+            SIZE_T read = 0;
+            stepTimer.Begin();
+            const bool readOk =
+                ReadProcessMemory(process,
+                                  reinterpret_cast<const void*>(region.address + offset),
+                                  bounce.data(), (SIZE_T)chunk, &read) != FALSE &&
+                read != 0;
+            result.rpmReadMs += stepTimer.Ms();
+            if (!readOk) {
                 ingressOk = false;
                 break;
             }
-            CachedChunk placed;
-            placed.vramOffset = vramOffset;
-            placed.bytes = (uint32_t)read;
-            region.chunks.push_back(placed);
+
+            stepTimer.Begin();
+            regionHash.Update(bounce.data(), (size_t)read);
+            result.hashMs += stepTimer.Ms();
+
+            stepTimer.Begin();
+            uint64_t vramOffset = 0;
+            const bool placed = PlaceChunk((uint32_t)read, vramOffset) &&
+                                StreamWrite(vramOffset, bounce.data(), (size_t)read);
+            result.vramWriteMs += stepTimer.Ms();
+            if (!placed) {
+                ingressOk = false;
+                break;
+            }
+            CachedChunk placedChunk;
+            placedChunk.vramOffset = vramOffset;
+            placedChunk.bytes = (uint32_t)read;
+            region.chunks.push_back(placedChunk);
 
             written += read;
             offset += read;
         }
-        region.hash = hash;
+        region.hash = regionHash.Final();
+        regionHashes.push_back(region.hash);
         if (!ingressOk) break;
     }
+    result.ingressMs = result.rpmReadMs + result.vramWriteMs + result.hashMs;
+    result.origHash = CombineHashes(regionHashes);
     result.bytes = written;
     result.regions = (int)regions.size();
-    result.ingressMs = ingressTimer.Ms();
 
     if (!ingressOk || written == 0) {
         ResumeProcess(process);
@@ -486,6 +505,8 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     }
 
     // Discard the physical pages: MEM_RESET keeps them out of pagefile.sys.
+    Timer resetTimer;
+    resetTimer.Begin();
     for (const CachedRegion& region : regions) {
         VirtualAllocEx(process, reinterpret_cast<void*>(region.address),
                        (SIZE_T)region.size, MEM_RESET, PAGE_READWRITE);
@@ -494,6 +515,7 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
                                QUOTA_LIMITS_HARDWS_MAX_ENABLE);
     EmptyWorkingSet(process);
     ApplyEcoQos(process, true);
+    result.resetTrimMs = resetTimer.Ms();
 
     PROCESS_MEMORY_COUNTERS after{};
     if (GetProcessMemoryInfo(process, &after, sizeof(after))) {
@@ -517,13 +539,12 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     result.ok = true;
     result.totalMs = totalTimer.Ms();
     Log(L"[cryo] frozen pid=%lu ws=%.0f->%.0f MB gddr6=%llu MB regions=%d threads=%d "
-        L"ingress=%.0f MB/s total=%.0f ms",
+        L"suspend=%.1f rpm=%.1f vram=%.1f hash=%.1f trim=%.1f total=%.1f ms",
         (unsigned long)pid, (double)result.wsBefore / (1024.0 * 1024.0),
         (double)result.wsAfter / (1024.0 * 1024.0),
         (unsigned long long)(written / kMb), result.regions, result.threads,
-        result.ingressMs > 0.0 ? (double)written / (1024.0 * 1024.0) /
-                                     (result.ingressMs / 1000.0) : 0.0,
-        result.totalMs);
+        result.suspendMs, result.rpmReadMs, result.vramWriteMs, result.hashMs,
+        result.resetTrimMs, result.totalMs);
     // Handles stay open across the suspend window on purpose: the process is
     // suspended, we keep nothing after this function.
     CloseHandle(process);
@@ -553,10 +574,14 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
     Timer timer;
     timer.Begin();
 
+    Timer stepTimer;
+    stepTimer.Begin();
     SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0);
     ApplyEcoQos(process, false);
+    result.resumeMs += stepTimer.Ms();
 
     std::vector<uint8_t> staging((size_t)kChunk);
+    std::vector<uint64_t> restoredHashes;
     uint64_t restored = 0;
 
     for (const CachedRegion& region : entry.regions) {
@@ -576,37 +601,53 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
         }
 
         ++result.dmaRegions;
-        uint64_t hash = 1469598103934665603ull;
+        Hash64 regionHash;
         uint64_t regionOffset = 0;
         for (const CachedChunk& chunk : region.chunks) {
             double chunkMbps = 0.0;
-            if (!pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes, staging.data(),
-                                        chunkMbps)) {
+            stepTimer.Begin();
+            const bool dmaOk = pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes,
+                                                      staging.data(), chunkMbps);
+            result.dmaGpuMs += stepTimer.Ms();
+            if (!dmaOk) {
                 result.checksumOk = false;
                 break;
             }
             if (chunkMbps > result.dmaMBps) result.dmaMBps = chunkMbps;
-            hash = Fnv1a(hash, staging.data(), chunk.bytes);
+
+            stepTimer.Begin();
+            regionHash.Update(staging.data(), chunk.bytes);
+            result.hashVerifyMs += stepTimer.Ms();
+
             SIZE_T wrote = 0;
-            if (!WriteProcessMemory(process,
-                                    reinterpret_cast<void*>(region.address + regionOffset),
-                                    staging.data(), (SIZE_T)chunk.bytes, &wrote) ||
-                wrote != chunk.bytes) {
+            stepTimer.Begin();
+            const bool writeOk =
+                WriteProcessMemory(process,
+                                   reinterpret_cast<void*>(region.address + regionOffset),
+                                   staging.data(), (SIZE_T)chunk.bytes, &wrote) != FALSE &&
+                wrote == chunk.bytes;
+            result.wpmWriteMs += stepTimer.Ms();
+            if (!writeOk) {
                 result.checksumOk = false;
                 break;
             }
             regionOffset += chunk.bytes;
             restored += chunk.bytes;
         }
-        if (hash != region.hash) {
+        restoredHashes.push_back(regionHash.Final());
+        if (restoredHashes.back() != region.hash) {
             result.checksumOk = false;
             Log(L"[cryo] pid=%lu region 0x%llX checksum mismatch", (unsigned long)pid,
                 (unsigned long long)region.address);
         }
     }
 
+    result.restoredHash = CombineHashes(restoredHashes);
+
+    stepTimer.Begin();
     ResumeProcess(process);
     CloseHandle(process);
+    result.resumeMs += stepTimer.Ms();
 
     result.bytes = restored;
     result.totalMs = timer.Ms();
@@ -617,8 +658,10 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
         stats_.lastWakeMs = result.totalMs;
         stats_.lastEgressMBps = result.dmaMBps;
     }
-    Log(L"[cryo] restored pid=%lu %llu MB in %.2f ms (dma=%d undo=%d checksum=%ls)",
+    Log(L"[cryo] restored pid=%lu %llu MB in %.2f ms (dma=%.1f hash=%.2f wpm=%.1f "
+        L"resume=%.1f dmaRegions=%d undo=%d checksum=%ls)",
         (unsigned long)pid, (unsigned long long)(restored / kMb), result.totalMs,
+        result.dmaGpuMs, result.hashVerifyMs, result.wpmWriteMs, result.resumeMs,
         result.dmaRegions, result.undoRegions, result.checksumOk ? L"MATCH" : L"MISMATCH");
     return result.ok;
 }

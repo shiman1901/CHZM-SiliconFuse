@@ -290,6 +290,10 @@ hardware state beyond its own resources.
 | 2.1 | Chunked 4 GB pool, granular eviction (this release) | 4 x 1 GB slices, partial yield under 6 GB load |
 | 3 | User-mode engine + control UI (this release) | 4 GB pool, manual/auto eviction, live UI |
 | 4 | WDF companion driver, block device, pagefile | Signed driver, IOMMU, no bugcheck in soak |
+| 5 | CryoSwap: DDR4 offload of background processes (this release) | Quota + EmptyWorkingSet, audio and foreground victims untouched |
+| 6 | CommitGuard, StandbyPurge, BAR1 telemetry (this release) | Pool never eats the WDDM commit reserve |
+| 7 | Honest GDDR6 hibernation: MEM_RESET -> DMA -> WriteProcessMemory (this release) | 512 MB returns 100% bit-for-bit after the RAM copy is wiped |
+| 8 | AVX2 checksum, sub-timers, 64/128/256/512 MB matrix (this release) | 512 MB hash < 15 ms, full restore < 350 ms |
 
 Phase 1 and later require either an NVIDIA cooperation agreement or an
 exclusive-compute configuration in which the display driver is not bound to
@@ -339,3 +343,67 @@ unsafe mapping path.
 
 See the risk section of `docs/ARCH_SPEC.md` before quoting any number from
 this repository.
+
+---
+
+## 10. Stage 7-8: CryoSwap measured on the reference platform
+
+`CryoSwap` moves private pages of background processes into the GDDR6 pool,
+tells the kernel to drop them (`MEM_RESET`, so nothing is written to
+`pagefile.sys`), clamps the working set and suspends the process. Focus restores
+it: `MEM_RESET_UNDO` when the pages survived, otherwise a copy-engine DMA out of
+VRAM followed by `WriteProcessMemory`.
+
+### 10.1 Honest end-to-end matrix (2026-11-05, RTX 3060 12 GB, 32 GB DDR4)
+
+| Size | WS before | WS after | Avail RAM delta | DMA ms | Hash ms | WPM ms | Restore ms | Bit match |
+|---|---|---|---|---|---|---|---|---|
+| 64 MB | 72.7 | 24.0 | +34 MB | 8.9 | 1.71 | 18.9 | 39.22 | 100% |
+| 128 MB | 136.7 | 24.0 | +103 MB | 16.7 | 3.58 | 48.7 | 78.00 | 100% |
+| 256 MB | 264.7 | 24.0 | +220 MB | 33.1 | 7.28 | 127.3 | 176.75 | 100% |
+| 512 MB | 520.7 | 23.9 | +489 MB | 64.6 | 14.86 | 302.4 | 391.07 | 100% |
+
+Single run; `WriteProcessMemory` varies by roughly 20 percent between runs
+(249-302 ms at 512 MB), everything else stays within 2 percent.
+
+### 10.2 Sub-timers, 512 MB
+
+| Phase | Stage | ms |
+|---|---|---|
+| Freeze | suspend + thread snapshot | 20.93 |
+| Freeze | `ReadProcessMemory` | 41.92 |
+| Freeze | AVX2 write into BAR1 | 47.21 |
+| Freeze | checksum | 14.64 |
+| Freeze | `MEM_RESET` + quota + `EmptyWorkingSet` | 47.07 |
+| Restore | GPU DMA (copy engine + fence) | 64.64 |
+| Restore | checksum | 14.86 |
+| Restore | `WriteProcessMemory` | 302.44 |
+| Restore | quota release + `NtResumeProcess` | 2.51 |
+
+### 10.3 Integrity proof
+
+For every size the test forces the "data is gone" condition before restoring:
+
+- the victim's pages are overwritten with zeros through `WriteProcessMemory`;
+- `MEM_RESET` + `HARDWS_MAX` + `EmptyWorkingSet` + standby purge discard them;
+- `MEM_RESET_UNDO` returns `NULL`, so no recovery from RAM or pagefile is possible;
+- the 512 MB restore is fed only by the copy engine from the four 1 GB slices.
+
+Three hashes are recorded per size: `orig_hash`, `zeroed_hash` (differs, as it
+must) and `restored_hash` (equal to `orig_hash`), and the victim re-reads its own
+buffer after resume: **100.0000% bit-for-bit**.
+
+### 10.4 What the numbers actually mean
+
+- The AVX2 checksum runs at 34.8 GB/s (1.80 ms / 64 MB); the sequential FNV-1a
+  it replaced needed ~350 ms for 512 MB.
+- Restore is no longer DMA bound. At 512 MB the copy engine needs 64.6 ms
+  (8.1 GB/s), the checksum 14.9 ms, and `WriteProcessMemory` 302 ms (~1.7 GB/s,
+  the kernel copy is the bottleneck).
+- Freeze is bound by `ReadProcessMemory` (42 ms) and the AVX2 store into BAR1
+  (47 ms) at 512 MB; both scale linearly.
+- Mode B (`EmptyWorkingSet` alone) drops the working set to 0 MB but pays one
+  page fault per 4 KB on the next touch: 131 072 faults for 512 MB. CryoSwap
+  pays 249 ms of write-back instead and keeps the bytes in VRAM.
+- `StandbyPurge` needs `SE_PROF_SINGLE_PROCESS`; without an elevated token the
+  call is a logged no-op.

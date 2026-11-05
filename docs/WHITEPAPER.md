@@ -215,6 +215,35 @@ The claims that must be tested, in order:
 Negative results are publishable. A failed Mode B experiment is more valuable
 than an unverified claim of 28 GB.
 
+### 5.1 Measured results, Stage 7-8 (2026-11-05)
+
+Reference platform: RTX 3060 12 GB (BAR1 16384 MiB, 4 x 1 GB WC L1 slices),
+32 GB DDR4, Windows 11.
+
+CryoSwap hibernates private pages of a background process into GDDR6, drops
+them with `MEM_RESET` (no pagefile write) and restores them through the copy
+engine plus `WriteProcessMemory` on focus. The test wipes the RAM copy with
+zeros before restoring, so the only surviving source is VRAM.
+
+| Size | WS before -> after | Avail RAM | DMA | Hash (AVX2) | WPM | Total restore | Integrity |
+|---|---|---|---|---|---|---|---|
+| 64 MB | 72.7 -> 24.0 | +34 MB | 8.9 ms | 1.71 ms | 18.9 ms | 39.22 ms | 100% |
+| 128 MB | 136.7 -> 24.0 | +103 MB | 16.7 ms | 3.58 ms | 48.7 ms | 78.00 ms | 100% |
+| 256 MB | 264.7 -> 24.0 | +220 MB | 33.1 ms | 7.28 ms | 127.3 ms | 176.75 ms | 100% |
+| 512 MB | 520.7 -> 23.9 | +489 MB | 64.6 ms | 14.86 ms | 302.4 ms | 391.07 ms | 100% |
+
+Ingress for 512 MB costs 190.1 ms in total (suspend 20.9, `ReadProcessMemory`
+41.9, AVX2 store into BAR1 47.2, checksum 14.6, `MEM_RESET` + quota + trim
+47.1). The store runs at 10.9 GB/s; the cross-process read is the limiter.
+
+Control experiment (Mode B): `EmptyWorkingSet` alone drops the working set to
+0 MB but produces exactly one major fault per 4 KB on the next touch
+(131 072 faults for 512 MB) and keeps nothing in VRAM. CryoSwap turns that into
+a 249 ms write-back of known-good bytes.
+
+Reproduction: `CHZM_SiliconFuse.exe --torture-test`, output in
+`docs/STAGE8_BENCHMARK_MATRIX.txt`.
+
 ---
 
 ## 6. Security and governance

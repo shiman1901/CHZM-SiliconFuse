@@ -1,0 +1,97 @@
+﻿CHZM//SILICONFUSE  STAGE 8  BENCHMARK MATRIX
+generated=2026-11-05 13:47:51
+mode=torture (matrix 64/128/256/512 MB)
+
+[TEST 1: BUILD + EMBEDDED ICON]
+  exe_size_bytes  = 1025678
+  rt_group_icon   = PRESENT (id 1)
+
+[TEST 2: POOL + COMMITGUARD + RAW BANDWIDTH]
+  adapter_vram_mb = 11964
+  pool_mb         = 4096
+  slices          = 4 x 1024 MB
+  commit_free_mb  = 26136 (guard floor 6144)
+  avx2_vram_write_mbps = 10872.2 (5.89 ms / 64 MB)
+  gpu_dma_read_mbps = 4407.2
+  avx2_hash_ms_64mb = 1.80 (34.8 GB/s, hash=6451794913016362337)
+  projected_512mb_hash_ms = 14.37
+
+[TEST 3: MODE A — BASELINE WINDOWS (no intervention)]
+  Size_MB | WS_Before_MB | PrivateCommit_MB | Saved_RAM_MB
+  --------+--------------+------------------+-------------
+       64 |         72.7 |             65.8 |            0
+      128 |        136.7 |            129.9 |            0
+      256 |        264.7 |            258.1 |            0
+      512 |        520.7 |            514.6 |            0
+
+[TEST 4: MODE B — PLAIN EmptyWorkingSet (no GDDR6)]
+  Size_MB | WS_Before_MB | WS_After_MB | PageFaults_Before | PageFaults_After_Touch | Fault_Delta
+  --------+--------------+-------------+-------------------+------------------------+------------
+       64 |         72.7 |         0.0 |             18712 |                  35096 |       16384
+      128 |        136.7 |         0.0 |             35129 |                  67897 |       32768
+      256 |        264.7 |         0.0 |             67959 |                 133495 |       65536
+      512 |        520.7 |         0.0 |            133622 |                 264694 |      131072
+
+[TEST 5: MODE C — CHZM CRYOSWAP GDDR6]
+  Size_MB | WS_Before | WS_After | AvailRAM_Delta | DMA_ms | Hash_ms | WPM_ms | Total_Restore_ms | BitMatch
+  --------+-----------+----------+----------------+--------+---------+--------+------------------+---------
+       64 |      72.7 |     24.0 |             34 |    8.9 |    1.71 |   18.9 |            39.22 | 100%
+      128 |     136.7 |     24.0 |            103 |   16.7 |    3.58 |   48.7 |            78.00 | 100%
+      256 |     264.7 |     24.0 |            220 |   33.1 |    7.28 |  127.3 |           176.75 | 100%
+      512 |     520.7 |     23.9 |            489 |   64.6 |   14.86 |  302.4 |           391.07 | 100%
+
+  --- SIZE 64 MB ---
+  freeze_total_ms = 62.63 (suspend 25.84 | rpm 5.87 | avx2_vram 5.94 | hash 1.92 | trim 6.06)
+  restore_total_ms= 39.22 (dma 8.92 | hash 1.71 | wpm 18.89 | resume 2.56)
+  regions         = 13 | dma_peak_mbps = 8062.4
+  zeroed_mb       = 64
+  orig_hash       = 7987300158715546304
+  zeroed_hash     = 6451794913016362337 (differs=1)
+  restored_hash   = 7987300158715546304 (equal=1)
+  gddr6_checksum  = MATCH
+
+  --- SIZE 128 MB ---
+  freeze_total_ms = 84.36 (suspend 28.06 | rpm 11.21 | avx2_vram 11.82 | hash 4.00 | trim 11.91)
+  restore_total_ms= 78.00 (dma 16.71 | hash 3.58 | wpm 48.74 | resume 2.47)
+  regions         = 13 | dma_peak_mbps = 8074.6
+  zeroed_mb       = 128
+  orig_hash       = 11680644373732826128
+  zeroed_hash     = 15924799602215108337 (differs=1)
+  restored_hash   = 11680644373732826128 (equal=1)
+  gddr6_checksum  = MATCH
+
+  --- SIZE 256 MB ---
+  freeze_total_ms = 126.84 (suspend 31.79 | rpm 21.46 | avx2_vram 23.59 | hash 7.44 | trim 24.61)
+  restore_total_ms= 176.75 (dma 33.12 | hash 7.28 | wpm 127.33 | resume 2.55)
+  regions         = 13 | dma_peak_mbps = 8028.7
+  zeroed_mb       = 256
+  orig_hash       = 16597115425250234687
+  zeroed_hash     = 1365465721669248823 (differs=1)
+  restored_hash   = 16597115425250234687 (equal=1)
+  gddr6_checksum  = MATCH
+
+  --- SIZE 512 MB ---
+  freeze_total_ms = 190.11 (suspend 20.93 | rpm 41.92 | avx2_vram 47.21 | hash 14.64 | trim 47.07)
+  restore_total_ms= 391.07 (dma 64.64 | hash 14.86 | wpm 302.44 | resume 2.51)
+  regions         = 13 | dma_peak_mbps = 8065.1
+  zeroed_mb       = 512
+  orig_hash       = 217649118834995978
+  zeroed_hash     = 9817862843330750604 (differs=1)
+  restored_hash   = 217649118834995978 (equal=1)
+  gddr6_checksum  = MATCH
+
+[TEST 6: COMMITGUARD]
+  free_commit_mb  = 26049 (floor 6144)
+  resize_2048_mb  = 2 slices
+  resize_4096_mb  = 4 slices
+
+[TEST 7: SENSORS + STANDBY PURGE]
+  nvml_fb_used_mb   = 4603 / 11964
+  nvml_bar1_used_mb = 16355 / 16384
+  dxgi_local_used_mb= 4104
+  standby_purge     = unavailable (needs admin)
+  frozen_processes  = 0
+  pool_end_mb       = 4096
+  free_commit_end_mb= 26048
+
+RESULT: STAGE 8 MATRIX FINISHED
