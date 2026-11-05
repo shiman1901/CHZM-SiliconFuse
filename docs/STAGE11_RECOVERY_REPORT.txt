@@ -1,0 +1,101 @@
+﻿CHZM//SILICONFUSE  STAGE 11  RECOVERY REPORT
+generated=2026-11-05 16:44:48
+mode=torture (chaos engineering)
+
+[TEST 1: BUILD + EMBEDDED ICON]
+  exe_size_bytes  = 1079079
+  rt_group_icon   = PRESENT (id 1)
+  mirror_flags    = FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
+  mirror_capacity = 4096 MB
+  physical_sector = 4096 bytes (must divide 4096)
+  journal         = cryo_journal.bin (WRITE_THROUGH, transactional)
+
+[TEST 2: POOL + COMMITGUARD + RAW BANDWIDTH]
+  adapter_vram_mb = 11964
+  pool_mb         = 4096
+  slices          = 4 x 1024 MB
+  commit_free_mb  = 20645 (floor 6144)
+  mirror_durable  = 1
+  avx2_vram_write_mbps = 10839.7 (5.90 ms / 64 MB)
+  avx2_hash_ms_64mb = 1.75 (35.8 GB/s, hash=6451794913016362337)
+
+[CHAOS 1: UNBUFFERED NVME MIRROR & ZERO CACHE LEAK (512 MB)]
+  frozen            = 1
+  mirror_durable    = 1
+  mirror_bytes_mb   = 512
+  write_io_delta_mb = 512 (>= 512 required)
+  reopen_mirror     = 1
+  vram_evicted      = 1 (84.85 ms)
+  read_io_delta_mb  = 512 (>= 512 required)
+  avail_ram_before  = 8065 MB
+  avail_ram_after   = 8539 MB
+  avail_ram_delta   = 474 MB (cache must not eat the win)
+  restored          = 1 (mirror regions 13)
+  checksum          = MATCH
+  bit_match         = 100.0000%
+
+[CHAOS 2: SIMULATED TDR / GPU DEVICE LOST RECOVERY (256 MB)]
+  frozen            = 1 (mirror_durable 1)
+  device_removed    = 1 (all D3D12 calls blocked)
+  dma_regions       = 0 (must be 0)
+  mirror_regions    = 13
+  mirror_bytes_mb   = 256
+  checksum          = MATCH
+  total_ms          = 257.71
+  bit_match         = 100.0000%
+
+[CHAOS 3A: VRAM BIT-FLIP SELF-HEALING (128 MB)]
+  bit_flip_in_vram  = 1 (offset 0x40000064)
+  restored          = 1
+  dma_regions       = 12 (corrupted region rejected)
+  mirror_regions    = 1 (healed from NVMe)
+  checksum          = MATCH
+  bit_match         = 100.0000%
+
+[CHAOS 3B: DUAL-SOURCE CORRUPTION SAFE LOCKOUT (64 MB)]
+  bit_flip_in_vram  = 1
+  bit_flip_in_mirror= 1
+  restore_returned  = 0 (must be 0)
+  safe_lockout      = 1
+  resumed           = 0 (must be 0)
+  action            = test terminates the victim manually
+
+[CHAOS 4: MID-FREEZE ABORT ROLLBACK (64 MB)]
+  injected_failure  = mirror write aborted at 50%
+  frozen            = 0 (must be 0)
+  mirror_durable    = 1
+  ws_before_mb      = 72.7
+  ws_after_mb       = 72.8 (unchanged, no MEM_RESET)
+  process_resumed   = 1
+  victim_intact     = 100.0000%
+
+[TEST 9: VRAM EVICTION SURVIVAL (REGRESSION)]
+  evicted_ms = 67.89 | mirror_regions = 13 | checksum = MATCH
+  restored = 1 | bit_match = 100.0000%
+
+[TEST 10: EXIT SAFETY (RestoreAllFrozen)]
+  frozen = 1 | restore_all = 1 | alive = 1 | frozen_left = 0
+  bit_match = 100.0000%
+
+[CHAOS 5: KILL-9 / TERMINATEPROCESS SURVIVAL (128 MB)]
+  worker_spawned    = 1
+  journal_state_pre = 3 (3 = SOURCE_RESET)
+  engine_killed     = 1 (TerminateProcess exit 99)
+  journal_state_post= 4 (4 = RESTORED)
+  guard_restored    = 1
+  bit_match         = 100.0000%
+  verdict           = 100.0000% BIT-FOR-BIT AFTER ENGINE TERMINATEPROCESS
+  pid_reuse_guard   = 1 (guard ran, exit 2)
+  forged_state_left = 3 (must stay 3, never restored)
+  target_alive      = 1 | target_intact = 100.0000%
+  verdict           = REFUSED (creation time mismatch, process untouched)
+
+[SENSORS]
+  nvml_fb_used_mb   = 4393 / 11964
+  nvml_bar1_used_mb = 16355 / 16384
+  mirror_bytes_used = 512 MB
+  mirror_durable    = 1
+  pool_end_mb       = 4096
+  free_commit_end_mb= 21565
+
+RESULT: STAGE 11 RECOVERY FINISHED

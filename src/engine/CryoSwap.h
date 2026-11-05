@@ -15,8 +15,9 @@
 #include <thread>
 #include <vector>
 
+#include "StorageBridge.h"
+
 class VramPool;
-class StorageBridge;
 
 // MEM_RESET_UNDO tells the kernel the contents that were discarded by MEM_RESET
 // are wanted again. If the pages were never physically reused the data is still
@@ -162,6 +163,8 @@ private:
 
     bool IsCritical(const std::wstring& name) const;
     bool PlaceAndWrite(const uint8_t* data, uint32_t bytes, uint64_t& vramOffset);
+    void JournalSync();
+    void JournalSetState(DWORD pid, uint32_t state);
     void PublishCycle(int frozen, int skippedAudio, int skippedCritical, int skippedSmall,
                       uint64_t hotBytes, uint64_t savedBytes, uint64_t cycleMs,
                       double ingressMBps);
@@ -185,4 +188,6 @@ private:
     uint64_t mirrorUsed_ = 0;
     std::atomic<bool> abortInjected_{ false };
     std::atomic<bool> safeLockout_{ false };
+    std::vector<JournalEntry> journal_;
+    std::mutex journalMutex_;
 };

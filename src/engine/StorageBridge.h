@@ -10,6 +10,29 @@
 #include <thread>
 #include <vector>
 
+// Transaction journal shared by the engine and the recovery guard.
+enum JournalState : uint32_t {
+    JournalPrepared = 1,       // regions known, nothing copied yet
+    JournalMirrorDurable = 2,  // VRAM + NVMe copies complete
+    JournalSourceReset = 3,    // MEM_RESET done, RAM copy is gone
+    JournalRestored = 4,       // process fully returned and resumed
+};
+
+struct JournalRegion {
+    uint64_t base = 0;
+    uint64_t bytes = 0;
+    uint64_t mirrorOffset = 0;
+    uint64_t hash = 0;
+};
+
+struct JournalEntry {
+    uint32_t pid = 0;
+    uint32_t state = JournalPrepared;
+    uint64_t creationTime = 0;
+    uint64_t frozenAt = 0;
+    std::vector<JournalRegion> regions;
+};
+
 // Host-side landing zone for evicted slices.
 //
 // Eviction copies VRAM into this buffer first; a Windows read served from here
@@ -61,6 +84,16 @@ public:
     };
     static IoSnapshot QueryIo();
 
+    // Transaction journal (cryo_journal.bin) and the physical sector size used
+    // to validate the unbuffered mirror alignment.
+    bool InitJournal(const std::wstring& directory);
+    bool OpenJournalReadOnly(const std::wstring& directory);
+    bool OpenJournalReadWrite(const std::wstring& directory);
+    bool OpenCryoMirrorExisting(const std::wstring& directory);
+    bool WriteJournal(const std::vector<JournalEntry>& entries);
+    bool ReadJournal(std::vector<JournalEntry>& entries);
+    uint32_t PhysicalSectorSize() const { return physicalSector_; }
+
 private:
     void WriterLoop();
 
@@ -75,6 +108,12 @@ private:
     std::mutex mirrorMutex_;
     std::atomic<uint64_t> mirrorBytes_{ 0 };
     std::atomic<bool> mirrorDurable_{ false };
+
+    HANDLE journal_ = INVALID_HANDLE_VALUE;
+    std::wstring journalPath_;
+    std::mutex journalMutex_;
+    uint32_t physicalSector_ = 0;
+    bool journalReadOnly_ = false;
 
     std::mutex ioMutex_;
     std::thread writer_;

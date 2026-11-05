@@ -362,6 +362,23 @@ void CryoSwap::SetEnabled(bool on)
 
 bool CryoSwap::IsCritical(const std::wstring& name) const { return IsBlockedName(name); }
 
+void CryoSwap::JournalSync()
+{
+    if (bridge_) bridge_->WriteJournal(journal_);
+}
+
+void CryoSwap::JournalSetState(DWORD pid, uint32_t state)
+{
+    std::lock_guard<std::mutex> lock(journalMutex_);
+    for (JournalEntry& entry : journal_) {
+        if (entry.pid == pid) {
+            entry.state = state;
+            break;
+        }
+    }
+    JournalSync();
+}
+
 // Spreads cached pages evenly over the slices (round-robin per chunk), and
 // skips slices that were evicted while we were copying, so a partially
 // evicted pool never aborts a freeze.
@@ -460,6 +477,31 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     }
     result.scanZeroMs = scanTimer.Ms();
 
+    // Journal: the victim is known, but nothing has been copied yet. This
+    // record lets the guard resume the process even if we die right now.
+    uint64_t creationTime = 0;
+    FILETIME createTime{}, exitTime{}, kernelTime{}, userTime{};
+    if (GetProcessTimes(process, &createTime, &exitTime, &kernelTime, &userTime)) {
+        creationTime = ((uint64_t)createTime.dwHighDateTime << 32) |
+                       createTime.dwLowDateTime;
+    }
+    {
+        std::lock_guard<std::mutex> lock(journalMutex_);
+        JournalEntry entry;
+        entry.pid = pid;
+        entry.state = JournalPrepared;
+        entry.creationTime = creationTime;
+        entry.frozenAt = GetTickCount64();
+        for (const CachedRegion& region : regions) {
+            JournalRegion journalRegion;
+            journalRegion.base = region.address;
+            journalRegion.bytes = region.size;
+            entry.regions.push_back(journalRegion);
+        }
+        journal_.push_back(std::move(entry));
+        JournalSync();
+    }
+
     if (regions.empty()) {
         ResumeProcess(process);
         CloseHandle(process);
@@ -551,6 +593,7 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     // the mirror copy are durable. Otherwise roll the transaction back and
     // leave the process exactly as it was.
     if (!ingressOk || written == 0 || !result.mirrorDurable) {
+        JournalSetState(pid, JournalRestored); // nothing was discarded
         ResumeProcess(process);
         CloseHandle(process);
         Log(L"[cryo] rollback pid=%lu: ingress=%d durable=%d written=%llu MB, "
@@ -558,6 +601,22 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
             (unsigned long)pid, ingressOk ? 1 : 0, result.mirrorDurable ? 1 : 0,
             (unsigned long long)(written / kMb));
         return false;
+    }
+
+    // Durable barrier: the region table and hashes must be on disk before the
+    // only RAM copy is thrown away.
+    {
+        std::lock_guard<std::mutex> lock(journalMutex_);
+        for (JournalEntry& entry : journal_) {
+            if (entry.pid != pid) continue;
+            for (size_t i = 0; i < entry.regions.size() && i < regions.size(); ++i) {
+                entry.regions[i].mirrorOffset =
+                    regions[i].chunks.empty() ? 0 : regions[i].chunks.front().mirrorOffset;
+                entry.regions[i].hash = regions[i].hash;
+            }
+            entry.state = JournalMirrorDurable;
+        }
+        JournalSync();
     }
 
     // Discard the physical pages: MEM_RESET keeps them out of pagefile.sys.
@@ -572,6 +631,7 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     EmptyWorkingSet(process);
     ApplyEcoQos(process, true);
     result.resetTrimMs = resetTimer.Ms();
+    JournalSetState(pid, JournalSourceReset);
 
     PROCESS_MEMORY_COUNTERS after{};
     if (GetProcessMemoryInfo(process, &after, sizeof(after))) {
@@ -766,6 +826,7 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
                          result.wpmWriteMs + result.resumeMs);
     result.ok = result.checksumOk;
     safeLockout_.store(false);
+    JournalSetState(pid, JournalRestored);
 
     {
         std::lock_guard<std::mutex> lock(statsMutex_);

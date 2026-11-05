@@ -296,6 +296,7 @@ hardware state beyond its own resources.
 | 8 | AVX2 checksum, sub-timers, 64/128/256/512 MB matrix (this release) | 512 MB hash < 15 ms, full restore < 350 ms |
 | 9 | Fail-safe mirror, eviction survival, exit auto-restore (this release) | 100% recovery after full VRAM eviction and a wiped RAM copy |
 | 10 | Chaos engineering: unbuffered mirror, simulated TDR, bit-flip healing (this release) | Dual-source corruption locks out safely, no resume on unproven pages |
+| 11 | Transactional journal + recovery guard, survives TerminateProcess (this release) | Victim recovered 100% after the engine is killed with exit code 99 |
 
 Phase 1 and later require either an NVIDIA cooperation agreement or an
 exclusive-compute configuration in which the display driver is not bound to
@@ -486,3 +487,61 @@ mirror is `durable`. If a write fails half way, the whole freeze rolls back:
 - Closing the program (tray `Exit`, `WM_DESTROY`) calls `RestoreAllFrozen()`.
 - `Ctrl+C` in a console host restores before exiting; `CTRL_SHUTDOWN_EVENT`
   does not.
+
+---
+
+## 13. Stage 11: surviving the death of the engine itself
+
+A frozen process is useless if the engine dies with it. The engine therefore
+keeps a write-through transaction journal and a separate guard process.
+
+### 13.1 Journal
+
+`cryo_journal.bin` is opened with `FILE_FLAG_WRITE_THROUGH` and rewritten on
+every state change, before the action it describes:
+
+| State | Meaning |
+|---|---|
+| 1 `PREPARED` | process known, nothing copied — a crash now only needs a resume |
+| 2 `MIRROR_DURABLE` | VRAM + NVMe copies complete, hashes recorded |
+| 3 `SOURCE_RESET` | `MEM_RESET` done, the RAM copy is gone |
+| 4 `RESTORED` | process fully returned and resumed |
+
+Each record stores `pid`, the process creation time (PID reuse protection) and
+the region table (`base`, `bytes`, `mirror_offset`, `expected_hash64`). The
+physical sector size of the volume is queried with
+`IOCTL_STORAGE_QUERY_PROPERTY` and reported (4096 bytes here).
+
+### 13.2 Guard
+
+The engine spawns `CHZM_SiliconFuse.exe --recovery-guard <own_pid>` with
+`CREATE_NO_WINDOW`. It opens a `SYNCHRONIZE` handle on the engine and waits. If
+the engine disappears:
+
+- all records `RESTORED` → exit 0, nothing to do;
+- records at `MIRROR_DURABLE`/`SOURCE_RESET` → the engine was killed: verify the
+  creation time, rebuild every region from the mirror, check the AVX2 hash, write
+  with `WriteProcessMemory`, lift the quota, `NtResumeProcess`, mark `RESTORED`;
+- records at `PREPARED` → just lift the quota and resume;
+- creation-time mismatch → refuse, log, exit 2 (never touch a recycled PID).
+
+The same replay runs at engine start, in case both the engine and the guard were
+killed.
+
+### 13.3 Measured (`--torture-test`, 2026-11-05)
+
+| Scenario | Result |
+|---|---|
+| Engine killed with `TerminateProcess(worker, 99)` while a 128 MB victim was frozen | journal `SOURCE_RESET` → guard restores → `RESTORED`, victim **100.0000%** bit-for-bit |
+| Forged journal record with a wrong creation time | guard exits 2, record stays at `SOURCE_RESET`, target process untouched and 100% intact |
+| Unbuffered mirror regression (512 MB) | write IO +512 MB, read IO +512 MB, available RAM +473 MB |
+| Simulated TDR, bit flips, mid-freeze abort | all still pass (regressions) |
+
+### 13.4 Shutdown semantics, final form
+
+`WM_ENDSESSION(wParam == TRUE)` now inspects `lParam`:
+
+- `ENDSESSION_CLOSEAPP` (Restart Manager closing only this app) →
+  `RestoreAllFrozen()` first, then exit;
+- `lParam == 0` or `ENDSESSION_LOGOFF` (real logoff/reboot) → immediate
+  `ExitProcess(0)`, no restore delay.

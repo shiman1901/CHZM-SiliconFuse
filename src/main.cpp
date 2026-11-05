@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <psapi.h>
 #include <shlobj.h>
 
@@ -56,9 +56,9 @@ std::wstring ReportPath()
 {
     const std::wstring docs = ExecutableDir() + L"\\..\\docs";
     if (GetFileAttributesW(docs.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return docs + L"\\STAGE10_CHAOS_REPORT.txt";
+        return docs + L"\\STAGE11_RECOVERY_REPORT.txt";
     }
-    return LocalAppData() + L"\\STAGE10_CHAOS_REPORT.txt";
+    return LocalAppData() + L"\\STAGE11_RECOVERY_REPORT.txt";
 }
 
 std::wstring VictimStatePath(uint64_t sizeMb)
@@ -347,6 +347,225 @@ void StopVictim(VictimHandle& handle)
     handle.alive = false;
 }
 
+// ------------------------------------------------------- recovery guard -----
+
+std::wstring ResolveDataDir()
+{
+    wchar_t buffer[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"CHZM_DATA_DIR", buffer, MAX_PATH);
+    if (length > 0) return buffer;
+    return LocalAppData();
+}
+
+uint64_t ProcessCreationTime(HANDLE process)
+{
+    FILETIME create{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(process, &create, &exit, &kernel, &user)) return 0;
+    return ((uint64_t)create.dwHighDateTime << 32) | create.dwLowDateTime;
+}
+
+bool ResumeByHandle(HANDLE process)
+{
+    typedef LONG(NTAPI* PfnNtResume)(HANDLE);
+    static PfnNtResume fn = reinterpret_cast<PfnNtResume>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtResumeProcess")));
+    return fn && fn(process) == 0;
+}
+
+bool UnparkProcess(HANDLE process)
+{
+    SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0);
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = 0;
+    SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
+    return ResumeByHandle(process);
+}
+
+bool RestoreEntryFromMirror(StorageBridge& bridge, HANDLE process,
+                            const JournalEntry& entry)
+{
+    const uint64_t chunk = 64ull * kMb;
+    auto* staging = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, (SIZE_T)chunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!staging) return false;
+
+    bool ok = true;
+    for (const JournalRegion& region : entry.regions) {
+        Hash64 hasher;
+        uint64_t done = 0;
+        while (done < region.bytes) {
+            const uint64_t piece = std::min(region.bytes - done, chunk);
+            if (!bridge.ReadMirror(region.mirrorOffset + done, staging, piece)) {
+                ok = false;
+                break;
+            }
+            hasher.Update(staging, (size_t)piece);
+            SIZE_T wrote = 0;
+            if (!WriteProcessMemory(process, reinterpret_cast<void*>(region.base + done),
+                                    staging, (SIZE_T)piece, &wrote) ||
+                wrote != piece) {
+                ok = false;
+                break;
+            }
+            done += piece;
+        }
+        if (!ok) break;
+        if (hasher.Final() != region.hash) {
+            ok = false;
+            break;
+        }
+    }
+    VirtualFree(staging, 0, MEM_RELEASE);
+    return ok;
+}
+
+struct RecoveryOutcome {
+    int restored = 0;
+    int resumedOnly = 0;
+    int pidReuseSkipped = 0;
+    int failed = 0;
+};
+
+// Replays cryo_journal.bin. Used by the guard after the engine dies and by the
+// engine itself on the next start.
+RecoveryOutcome RecoverFromJournal(StorageBridge& bridge)
+{
+    RecoveryOutcome outcome;
+    std::vector<JournalEntry> entries;
+    if (!bridge.ReadJournal(entries)) return outcome;
+
+    bool changed = false;
+    for (JournalEntry& entry : entries) {
+        if (entry.state == JournalRestored) continue;
+
+        HANDLE process = OpenProcess(PROCESS_SUSPEND_RESUME |
+                                         PROCESS_QUERY_LIMITED_INFORMATION |
+                                         PROCESS_SET_QUOTA | PROCESS_VM_READ |
+                                         PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                                     FALSE, entry.pid);
+        if (!process) {
+            ++outcome.failed;
+            continue;
+        }
+
+        // PID reuse protection: the creation time must match exactly.
+        if (ProcessCreationTime(process) != entry.creationTime) {
+            ++outcome.pidReuseSkipped;
+            CloseHandle(process);
+            continue;
+        }
+
+        bool ok = true;
+        if (entry.state >= JournalMirrorDurable && !entry.regions.empty()) {
+            ok = RestoreEntryFromMirror(bridge, process, entry);
+        }
+
+        if (ok) {
+            UnparkProcess(process);
+            entry.state = JournalRestored;
+            changed = true;
+            if (entry.regions.empty()) ++outcome.resumedOnly; else ++outcome.restored;
+        } else {
+            ++outcome.failed;
+        }
+        CloseHandle(process);
+    }
+
+    if (changed) bridge.WriteJournal(entries);
+    return outcome;
+}
+
+int RunRecoveryGuard(DWORD parentPid)
+{
+    if (parentPid != 0) {
+        HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parentPid);
+        if (parent) {
+            WaitForSingleObject(parent, INFINITE);
+            CloseHandle(parent);
+        }
+    }
+
+    const std::wstring dir = ResolveDataDir();
+    StorageBridge bridge;
+    bridge.OpenCryoMirrorExisting(dir);
+    bridge.OpenJournalReadWrite(dir);
+    const RecoveryOutcome outcome = RecoverFromJournal(bridge);
+    bridge.Shutdown();
+
+    // 2 tells the caller that at least one record was refused (PID reuse).
+    return outcome.pidReuseSkipped > 0 ? 2 : 0;
+}
+
+void SpawnRecoveryGuard()
+{
+    std::wstring command = L"\"" + ExecutablePath() + L"\" --recovery-guard " +
+                           std::to_wstring(GetCurrentProcessId());
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child)) {
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+    }
+}
+
+int RunFreezeVictim(DWORD victimPid, const std::wstring& dataDir)
+{
+    StorageBridge bridge;
+    if (!bridge.Init(dataDir, 6ull * 64ull * kMb)) return 2;
+    if (!bridge.InitCryoMirror(dataDir, kMirrorCapacity)) return 2;
+    if (!bridge.InitJournal(dataDir)) return 2;
+
+    VramPool pool;
+    if (!pool.Init(&bridge, 0, 1024, dataDir + L"\\engine.log")) return 3;
+    CryoSwap cryo;
+    cryo.Init(&pool, &bridge);
+
+    SpawnRecoveryGuard();
+
+    FreezeResult freeze;
+    if (!cryo.CryoFreeze(victimPid, freeze)) return 4;
+
+    // Worst case for the guard: the RAM copy is wiped before the kill.
+    const std::vector<CachedProcess> snapshot = cryo.SnapshotFrozen();
+    for (const CachedProcess& cached : snapshot) {
+        if (cached.pid != victimPid) continue;
+        HANDLE process = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                                         PROCESS_QUERY_LIMITED_INFORMATION,
+                                     FALSE, victimPid);
+        if (!process) break;
+        std::vector<uint8_t> zeros((size_t)(16ull * kMb), 0);
+        for (const CachedRegion& region : cached.regions) {
+            uint64_t offset = 0;
+            while (offset < region.size) {
+                const uint64_t piece =
+                    std::min(region.size - offset, (uint64_t)zeros.size());
+                SIZE_T wrote = 0;
+                if (!WriteProcessMemory(process,
+                                        reinterpret_cast<void*>(region.address + offset),
+                                        zeros.data(), (SIZE_T)piece, &wrote) || wrote == 0) {
+                    break;
+                }
+                offset += wrote;
+            }
+            VirtualAllocEx(process, reinterpret_cast<void*>(region.address),
+                           (SIZE_T)region.size, MEM_RESET, PAGE_READWRITE);
+        }
+        SetProcessWorkingSetSizeEx(process, 4ull * kMb, 24ull * kMb,
+                                   QUOTA_LIMITS_HARDWS_MAX_ENABLE);
+        EmptyWorkingSet(process);
+        CloseHandle(process);
+    }
+    PurgeLowPriorityStandbyList();
+
+    // The test kills us with TerminateProcess(99); the guard does the rest.
+    Sleep(INFINITE);
+    return 0;
+}
+
 // --------------------------------------------------------------- report -----
 
 double SumFreezePhases(const FreezeResult& f)
@@ -406,7 +625,7 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
 
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    Report(out, L"CHZM//SILICONFUSE  STAGE 10  CHAOS REPORT");
+    Report(out, L"CHZM//SILICONFUSE  STAGE 11  RECOVERY REPORT");
     Report(out, L"generated=%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth,
            now.wDay, now.wHour, now.wMinute, now.wSecond);
     Report(out, L"mode=%ls", full ? L"torture (chaos engineering)" : L"quick");
@@ -425,7 +644,11 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
     Report(out, L"  exe_size_bytes  = %llu", (unsigned long long)exeBytes);
     Report(out, L"  rt_group_icon   = %ls", iconGroup ? L"PRESENT (id 1)" : L"MISSING");
     Report(out, L"  mirror_flags    = FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH");
-    Report(out, L"  mirror_capacity = %llu MB", (unsigned long long)(kMirrorCapacity / kMb));
+    Report(out, L"  mirror_capacity = %llu MB",
+           (unsigned long long)(kMirrorCapacity / kMb));
+    Report(out, L"  physical_sector = %u bytes (must divide 4096)",
+           bridge.PhysicalSectorSize());
+    Report(out, L"  journal         = cryo_journal.bin (WRITE_THROUGH, transactional)");
     Report(out, L"");
 
     // ---------------------------------------------------------- TEST 2 -----
@@ -724,6 +947,174 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
     }
     Report(out, L"");
 
+    // --------------------------------------------------------- CHAOS 5 -----
+    Report(out, L"[CHAOS 5: KILL-9 / TERMINATEPROCESS SURVIVAL (128 MB)]");
+    if (full) {
+        const std::wstring sandbox = dataDir + L"\\chaos5";
+        CreateDirectoryW(sandbox.c_str(), nullptr);
+        DeleteFileW((sandbox + L"\\cryo_journal.bin").c_str());
+        DeleteFileW((sandbox + L"\\cryo_mirror.bin").c_str());
+        DeleteFileW((sandbox + L"\\spill.bin").c_str());
+
+        // Children (worker and guard) inherit the sandbox through the env.
+        SetEnvironmentVariableW(L"CHZM_DATA_DIR", sandbox.c_str());
+
+        VictimHandle victim;
+        if (StartVictim(128, 51, victim)) {
+            std::wstring command = L"\"" + ExecutablePath() + L"\" --freeze-victim " +
+                                   std::to_wstring(victim.marker.pid);
+            STARTUPINFOW startup{};
+            startup.cb = sizeof(startup);
+            PROCESS_INFORMATION worker{};
+            const bool spawned =
+                CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &startup, &worker) != FALSE;
+
+            uint32_t stateBeforeKill = 0;
+            uint32_t stateAfterKill = 0;
+            DWORD workerExit = 0;
+            bool guardRestored = false;
+
+            if (spawned) {
+                for (int i = 0; i < 300 &&
+                                GetFileAttributesW((sandbox + L"\\cryo_journal.bin").c_str()) ==
+                                    INVALID_FILE_ATTRIBUTES; ++i) {
+                    Sleep(100);
+                }
+
+                StorageBridge reader;
+                reader.OpenCryoMirrorExisting(sandbox);
+                reader.OpenJournalReadOnly(sandbox);
+
+                auto stateOf = [&reader](DWORD pid) -> uint32_t {
+                    std::vector<JournalEntry> entries;
+                    if (!reader.ReadJournal(entries)) return 0;
+                    for (const JournalEntry& entry : entries) {
+                        if (entry.pid == pid) return entry.state;
+                    }
+                    return 0;
+                };
+
+                for (int i = 0; i < 300; ++i) {
+                    stateBeforeKill = stateOf(victim.marker.pid);
+                    if (stateBeforeKill == JournalSourceReset) break;
+                    Sleep(100);
+                }
+
+                // Task Manager style kill of the engine process.
+                TerminateProcess(worker.hProcess, 99);
+                WaitForSingleObject(worker.hProcess, 5000);
+                GetExitCodeProcess(worker.hProcess, &workerExit);
+                CloseHandle(worker.hThread);
+                CloseHandle(worker.hProcess);
+
+                // The guard waits on the worker handle and must now recover.
+                for (int i = 0; i < 600; ++i) {
+                    stateAfterKill = stateOf(victim.marker.pid);
+                    if (stateAfterKill == JournalRestored) {
+                        guardRestored = true;
+                        break;
+                    }
+                    Sleep(100);
+                }
+                reader.Shutdown();
+            }
+
+            if (victim.verify) SetEvent(victim.verify);
+            const double percent = QueryVictimMatch(128);
+
+            Report(out, L"  worker_spawned    = %d", spawned ? 1 : 0);
+            Report(out, L"  journal_state_pre = %u (3 = SOURCE_RESET)", stateBeforeKill);
+            Report(out, L"  engine_killed     = 1 (TerminateProcess exit %lu)",
+                   (unsigned long)workerExit);
+            Report(out, L"  journal_state_post= %u (4 = RESTORED)", stateAfterKill);
+            Report(out, L"  guard_restored    = %d", guardRestored ? 1 : 0);
+            Report(out, L"  bit_match         = %.4f%%", percent);
+            Report(out, L"  verdict           = %ls",
+                   percent >= 100.0 ? L"100.0000% BIT-FOR-BIT AFTER ENGINE TERMINATEPROCESS"
+                                    : L"FAILED");
+            StopVictim(victim);
+            cryo.Reset();
+
+            // ------------------------------------------- PID reuse guard ----
+            VictimHandle other;
+            if (StartVictim(64, 52, other)) {
+                HANDLE otherHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                                 other.marker.pid);
+                const uint64_t realCreation =
+                    otherHandle ? ProcessCreationTime(otherHandle) : 0;
+                if (otherHandle) CloseHandle(otherHandle);
+
+                StorageBridge forge;
+                forge.OpenCryoMirrorExisting(sandbox);
+                forge.OpenJournalReadWrite(sandbox);
+                std::vector<JournalEntry> entries;
+                forge.ReadJournal(entries);
+                JournalEntry fake;
+                fake.pid = other.marker.pid;
+                fake.state = JournalSourceReset;
+                fake.creationTime = realCreation + 1; // deliberately wrong
+                entries.push_back(fake);
+                forge.WriteJournal(entries);
+                forge.Shutdown();
+
+                std::wstring guardCommand = L"\"" + ExecutablePath() +
+                                            L"\" --recovery-guard 0";
+                STARTUPINFOW guardStartup{};
+                guardStartup.cb = sizeof(guardStartup);
+                PROCESS_INFORMATION guard{};
+                DWORD guardExit = 0;
+                bool ran = false;
+                if (CreateProcessW(nullptr, guardCommand.data(), nullptr, nullptr, FALSE,
+                                   CREATE_NO_WINDOW, nullptr, nullptr, &guardStartup,
+                                   &guard)) {
+                    WaitForSingleObject(guard.hProcess, 30000);
+                    GetExitCodeProcess(guard.hProcess, &guardExit);
+                    CloseHandle(guard.hThread);
+                    CloseHandle(guard.hProcess);
+                    ran = true;
+                }
+
+                StorageBridge verifyJournal;
+                verifyJournal.OpenCryoMirrorExisting(sandbox);
+                verifyJournal.OpenJournalReadOnly(sandbox);
+                std::vector<JournalEntry> after;
+                verifyJournal.ReadJournal(after);
+                verifyJournal.Shutdown();
+                uint32_t forgedState = 0;
+                for (const JournalEntry& entry : after) {
+                    if (entry.pid == other.marker.pid) forgedState = entry.state;
+                }
+
+                const bool alive =
+                    WaitForSingleObject(other.child.hProcess, 0) != WAIT_OBJECT_0;
+                if (other.verify) SetEvent(other.verify);
+                const double otherPercent = QueryVictimMatch(64);
+
+                Report(out, L"  pid_reuse_guard   = %d (guard ran, exit %lu)",
+                       ran ? 1 : 0, (unsigned long)guardExit);
+                Report(out, L"  forged_state_left = %u (must stay 3, never restored)",
+                       forgedState);
+                Report(out, L"  target_alive      = %d | target_intact = %.4f%%",
+                       alive ? 1 : 0, otherPercent);
+                Report(out, L"  verdict           = %ls",
+                       (forgedState == JournalSourceReset && guardExit == 2)
+                           ? L"REFUSED (creation time mismatch, process untouched)"
+                           : L"UNEXPECTED");
+                StopVictim(other);
+            }
+
+            DeleteFileW((sandbox + L"\\cryo_journal.bin").c_str());
+            DeleteFileW((sandbox + L"\\cryo_mirror.bin").c_str());
+        } else {
+            Report(out, L"  victim_spawn = FAILED");
+            StopVictim(victim);
+        }
+
+        SetEnvironmentVariableW(L"CHZM_DATA_DIR", nullptr);
+    }
+    Report(out, L"");
+
     Report(out, L"[SENSORS]");
     PoolStats sensors = pool.GetStats();
     Report(out, L"  nvml_fb_used_mb   = %llu / %llu",
@@ -738,11 +1129,19 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
            (unsigned long long)(pool.GetStats().poolBytes / kMb));
     Report(out, L"  free_commit_end_mb= %llu", (unsigned long long)FreeCommitMb());
     Report(out, L"");
-    Report(out, L"RESULT: %ls", L"STAGE 10 CHAOS FINISHED");
+    Report(out, L"RESULT: %ls", L"STAGE 11 RECOVERY FINISHED");
 
     fclose(out);
     pool.Log(L"[torture] stage 10 report written to %ls", path.c_str());
     return 0;
+}
+
+DWORD ParsePidAfter(const std::wstring& arguments, const wchar_t* flag)
+{
+    const size_t position = arguments.find(flag);
+    if (position == std::wstring::npos) return 0;
+    const wchar_t* rest = arguments.c_str() + position + wcslen(flag);
+    return (DWORD)wcstoul(rest, nullptr, 10);
 }
 
 } // namespace
@@ -769,8 +1168,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
     if (arguments.find(L"--cryo-victim") != std::wstring::npos) {
         return RunCryoVictim(arguments);
     }
+    if (arguments.find(L"--recovery-guard") != std::wstring::npos) {
+        return RunRecoveryGuard(ParsePidAfter(arguments, L"--recovery-guard"));
+    }
+    if (arguments.find(L"--freeze-victim") != std::wstring::npos) {
+        return RunFreezeVictim(ParsePidAfter(arguments, L"--freeze-victim"),
+                               ResolveDataDir());
+    }
 
-    const std::wstring dataDir = LocalAppData();
+    const std::wstring dataDir = ResolveDataDir();
     CreateDirectoryW(dataDir.c_str(), nullptr);
     const std::wstring logPath = dataDir + L"\\engine.log";
     const bool torture = arguments.find(L"--torture-test") != std::wstring::npos;
@@ -786,12 +1192,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
         return 0;
     }
 
+    // Replay an unfinished journal from a previous crash before touching the
+    // mirror (InitCryoMirror truncates it).
+    if (!headless) {
+        StorageBridge recovery;
+        recovery.OpenCryoMirrorExisting(dataDir);
+        if (recovery.OpenJournalReadWrite(dataDir)) {
+            const RecoveryOutcome outcome = RecoverFromJournal(recovery);
+            recovery.Shutdown();
+            if (outcome.restored || outcome.resumedOnly || outcome.pidReuseSkipped) {
+                FILE* log = _wfsopen(logPath.c_str(), L"a, ccs=UTF-8", _SH_DENYNO);
+                if (log) {
+                    fwprintf(log, L"[recovery] startup: restored=%d resumed=%d "
+                                  L"pidreuse_skipped=%d failed=%d\n",
+                             outcome.restored, outcome.resumedOnly,
+                             outcome.pidReuseSkipped, outcome.failed);
+                    fclose(log);
+                }
+            }
+        } else {
+            recovery.Shutdown();
+        }
+    }
+
     StorageBridge bridge;
     if (!bridge.Init(dataDir, 6ull * 64ull * 1024ull * 1024ull)) {
         if (mutex) CloseHandle(mutex);
         return 2;
     }
     if (!bridge.InitCryoMirror(dataDir, kMirrorCapacity)) {
+        if (mutex) CloseHandle(mutex);
+        return 2;
+    }
+    if (!bridge.InitJournal(dataDir)) {
         if (mutex) CloseHandle(mutex);
         return 2;
     }
@@ -823,6 +1256,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
 
     pool.StartMonitor();
     cryo.StartMonitor();
+    SpawnRecoveryGuard();
 
     MainWindow window;
     if (!window.Create(instance, &pool, &cryo, ExecutablePath())) {

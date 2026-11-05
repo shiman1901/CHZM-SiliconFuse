@@ -1,5 +1,7 @@
 #include "StorageBridge.h"
 
+#include <winioctl.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -201,6 +203,211 @@ StorageBridge::IoSnapshot StorageBridge::QueryIo()
         snapshot.readBytes = counters.ReadTransferCount;
     }
     return snapshot;
+}
+
+namespace {
+
+constexpr uint32_t kJournalMagic = 0x31524A43; // "CRJ1"
+constexpr uint32_t kJournalVersion = 1;
+
+struct JournalHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+    uint32_t reserved;
+};
+
+struct JournalEntryHeader {
+    uint32_t pid;
+    uint32_t state;
+    uint64_t creationTime;
+    uint64_t frozenAt;
+    uint32_t regionCount;
+    uint32_t reserved;
+};
+
+uint32_t QueryPhysicalSector(const std::wstring& directory)
+{
+    // "\\.\C:" style volume handle, read-only metadata query.
+    if (directory.size() < 2) return 0;
+    std::wstring volume = L"\\\\.\\" + directory.substr(0, 2);
+    HANDLE handle = CreateFileW(volume.c_str(), 0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return 0;
+
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageAccessAlignmentProperty;
+    query.QueryType = PropertyStandardQuery;
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR alignment{};
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query,
+                                    sizeof(query), &alignment, sizeof(alignment),
+                                    &returned, nullptr);
+    CloseHandle(handle);
+    return ok ? alignment.BytesPerPhysicalSector : 0;
+}
+
+} // namespace
+
+bool StorageBridge::InitJournal(const std::wstring& directory)
+{
+    std::lock_guard<std::mutex> lock(journalMutex_);
+    if (journal_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(journal_);
+        journal_ = INVALID_HANDLE_VALUE;
+    }
+    journalPath_ = directory + L"\\cryo_journal.bin";
+    journalReadOnly_ = false;
+    physicalSector_ = QueryPhysicalSector(directory);
+    journal_ = CreateFileW(journalPath_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    return journal_ != INVALID_HANDLE_VALUE;
+}
+
+bool StorageBridge::OpenJournalReadOnly(const std::wstring& directory)
+{
+    std::lock_guard<std::mutex> lock(journalMutex_);
+    if (journal_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(journal_);
+        journal_ = INVALID_HANDLE_VALUE;
+    }
+    journalPath_ = directory + L"\\cryo_journal.bin";
+    journalReadOnly_ = true;
+    if (physicalSector_ == 0) physicalSector_ = QueryPhysicalSector(directory);
+    journal_ = CreateFileW(journalPath_.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    return journal_ != INVALID_HANDLE_VALUE;
+}
+
+bool StorageBridge::OpenJournalReadWrite(const std::wstring& directory)
+{
+    std::lock_guard<std::mutex> lock(journalMutex_);
+    if (journal_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(journal_);
+        journal_ = INVALID_HANDLE_VALUE;
+    }
+    journalPath_ = directory + L"\\cryo_journal.bin";
+    journalReadOnly_ = false;
+    if (physicalSector_ == 0) physicalSector_ = QueryPhysicalSector(directory);
+    journal_ = CreateFileW(journalPath_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    return journal_ != INVALID_HANDLE_VALUE;
+}
+
+bool StorageBridge::OpenCryoMirrorExisting(const std::wstring& directory)
+{
+    std::lock_guard<std::mutex> lock(mirrorMutex_);
+    if (mirror_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(mirror_);
+        mirror_ = INVALID_HANDLE_VALUE;
+    }
+    mirrorPath_ = directory + L"\\cryo_mirror.bin";
+    mirror_ = CreateFileW(mirrorPath_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                              FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+                          nullptr);
+    if (mirror_ == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(mirror_, &size)) {
+        mirrorBytes_.store((uint64_t)size.QuadPart);
+        mirrorCapacity_ = (uint64_t)size.QuadPart;
+    }
+    mirrorDurable_.store(true);
+    return true;
+}
+
+bool StorageBridge::WriteJournal(const std::vector<JournalEntry>& entries)
+{
+    std::lock_guard<std::mutex> lock(journalMutex_);
+    if (journal_ == INVALID_HANDLE_VALUE || journalReadOnly_) return false;
+
+    size_t bytes = sizeof(JournalHeader);
+    for (const JournalEntry& entry : entries) {
+        bytes += sizeof(JournalEntryHeader) + entry.regions.size() * sizeof(JournalRegion);
+    }
+
+    std::vector<uint8_t> buffer(bytes, 0);
+    uint8_t* cursor = buffer.data();
+
+    JournalHeader header{};
+    header.magic = kJournalMagic;
+    header.version = kJournalVersion;
+    header.count = (uint32_t)entries.size();
+    std::memcpy(cursor, &header, sizeof(header));
+    cursor += sizeof(header);
+
+    for (const JournalEntry& entry : entries) {
+        JournalEntryHeader record{};
+        record.pid = entry.pid;
+        record.state = entry.state;
+        record.creationTime = entry.creationTime;
+        record.frozenAt = entry.frozenAt;
+        record.regionCount = (uint32_t)entry.regions.size();
+        std::memcpy(cursor, &record, sizeof(record));
+        cursor += sizeof(record);
+        if (!entry.regions.empty()) {
+            const size_t regionBytes = entry.regions.size() * sizeof(JournalRegion);
+            std::memcpy(cursor, entry.regions.data(), regionBytes);
+            cursor += regionBytes;
+        }
+    }
+
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(journal_, zero, nullptr, FILE_BEGIN)) return false;
+    DWORD written = 0;
+    if (!WriteFile(journal_, buffer.data(), (DWORD)buffer.size(), &written, nullptr) ||
+        written != buffer.size()) {
+        return false;
+    }
+    FlushFileBuffers(journal_);
+    return true;
+}
+
+bool StorageBridge::ReadJournal(std::vector<JournalEntry>& entries)
+{
+    std::lock_guard<std::mutex> lock(journalMutex_);
+    entries.clear();
+    if (journal_ == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(journal_, zero, nullptr, FILE_BEGIN)) return false;
+
+    JournalHeader header{};
+    DWORD read = 0;
+    if (!ReadFile(journal_, &header, sizeof(header), &read, nullptr) ||
+        read != sizeof(header) || header.magic != kJournalMagic) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < header.count; ++i) {
+        JournalEntryHeader record{};
+        if (!ReadFile(journal_, &record, sizeof(record), &read, nullptr) ||
+            read != sizeof(record)) {
+            return false;
+        }
+        JournalEntry entry;
+        entry.pid = record.pid;
+        entry.state = record.state;
+        entry.creationTime = record.creationTime;
+        entry.frozenAt = record.frozenAt;
+        entry.regions.resize(record.regionCount);
+        if (record.regionCount > 0) {
+            const size_t regionBytes = record.regionCount * sizeof(JournalRegion);
+            if (!ReadFile(journal_, entry.regions.data(), (DWORD)regionBytes, &read,
+                          nullptr) ||
+                read != regionBytes) {
+                return false;
+            }
+        }
+        entries.push_back(std::move(entry));
+    }
+    return true;
 }
 
 bool StorageBridge::ReadFromStaging(uint64_t offset, void* dst, size_t length)

@@ -296,6 +296,36 @@ Session semantics follow the same asymmetry: user-initiated exit restores every
 frozen process, while a real `WM_ENDSESSION` shutdown exits immediately and
 leaves the victims to the OS.
 
+### 5.4 Surviving the death of the engine, Stage 11
+
+A journal makes the hibernation transactional. `cryo_journal.bin`
+(`FILE_FLAG_WRITE_THROUGH`) records `pid`, process creation time and the region
+table, and is rewritten before every action:
+
+`PREPARED` → `MIRROR_DURABLE` (before `MEM_RESET`) → `SOURCE_RESET` →
+`RESTORED`.
+
+A guard process (`--recovery-guard <engine_pid>`, same binary, no window, no
+D3D12) waits on the engine handle. When the engine is killed — Task Manager,
+`TerminateProcess`, a crash — the guard replays the journal: creation time must
+match, every region is re-read from the unbuffered mirror, hashed, written back
+with `WriteProcessMemory`, the quota is lifted and `NtResumeProcess` resumes the
+victim. A `PREPARED` record only needs the resume, because nothing was discarded
+yet.
+
+Measured results:
+
+| Scenario | Outcome |
+|---|---|
+| Engine killed with `TerminateProcess(…, 99)`, 128 MB victim frozen | guard restored it, **100.0000%** bit-for-bit |
+| Forged record with a wrong creation time (PID reuse) | guard exits 2, record refused, target untouched |
+| Unbuffered mirror, 512 MB | write IO +512 MB, read IO +512 MB, RAM +473 MB |
+
+The physical sector size of the volume is queried with
+`IOCTL_STORAGE_QUERY_PROPERTY` and reported (4096 bytes on the reference
+machine), which is what makes the `FILE_FLAG_NO_BUFFERING` mirror provably
+aligned.
+
 ---
 
 ## 6. Security and governance
