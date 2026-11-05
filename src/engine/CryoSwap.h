@@ -16,6 +16,7 @@
 #include <vector>
 
 class VramPool;
+class StorageBridge;
 
 // MEM_RESET_UNDO tells the kernel the contents that were discarded by MEM_RESET
 // are wanted again. If the pages were never physically reused the data is still
@@ -34,11 +35,14 @@ struct FreezeResult {
 
     // Sub-timers (ms).
     double suspendMs = 0.0;     // NtSuspendProcess + thread snapshot check
+    double scanZeroMs = 0.0;    // VirtualQueryEx region scan
     double rpmReadMs = 0.0;     // ReadProcessMemory
     double vramWriteMs = 0.0;   // AVX2 streaming into BAR1
+    double mirrorWriteMs = 0.0; // fail-safe copy to StorageBridge
     double resetTrimMs = 0.0;   // MEM_RESET + HARDWS quota + EmptyWorkingSet
     double hashMs = 0.0;        // checksum of the copied pages
     double ingressMs = 0.0;     // rpmReadMs + vramWriteMs + hashMs
+    double overheadMs = 0.0;    // totalMs - sum(phases)
     double totalMs = 0.0;
 
     uint64_t origHash = 0;      // combined checksum of all cached regions
@@ -49,14 +53,18 @@ struct RestoreResult {
     uint64_t bytes = 0;
     double dmaMBps = 0.0;
     int dmaRegions = 0;
+    int mirrorRegions = 0;      // regions served by the StorageBridge mirror
+    uint64_t mirrorBytes = 0;
     int undoRegions = 0;
     bool checksumOk = true;
 
     // Sub-timers (ms).
     double dmaGpuMs = 0.0;      // copy engine + fence wait
+    double fallbackMs = 0.0;    // StorageBridge mirror reads (evicted VRAM)
     double hashVerifyMs = 0.0;  // checksum of the DMA'd pages
     double wpmWriteMs = 0.0;    // WriteProcessMemory
     double resumeMs = 0.0;      // quota release + NtResumeProcess
+    double overheadMs = 0.0;    // totalMs - sum(phases)
     double totalMs = 0.0;
 
     uint64_t restoredHash = 0;
@@ -82,6 +90,7 @@ struct CryoStats {
 
 struct CachedChunk {
     uint64_t vramOffset = 0;
+    uint64_t mirrorOffset = 0;
     uint32_t bytes = 0;
 };
 
@@ -113,7 +122,7 @@ public:
     // SE_INC_BASE_PRIORITY, SE_PROF_SINGLE_PROCESS, SE_DEBUG.
     static bool EnablePrivileges();
 
-    bool Init(VramPool* pool);
+    bool Init(VramPool* pool, StorageBridge* bridge);
     void Shutdown();
 
     void StartMonitor();
@@ -129,6 +138,8 @@ public:
 
     int RunCycle(DWORD onlyPid = 0);
     int Reset();
+    // Fail-safe: bring every frozen process back (used on exit and crashes).
+    int RestoreAllFrozen();
 
     bool IsFrozen(DWORD pid) const;
     bool WakeNow(DWORD pid, double& wakeMs);
@@ -144,12 +155,13 @@ private:
     void Log(const wchar_t* format, ...);
 
     bool IsCritical(const std::wstring& name) const;
-    bool PlaceChunk(uint32_t bytes, uint64_t& vramOffset);
+    bool PlaceAndWrite(const uint8_t* data, uint32_t bytes, uint64_t& vramOffset);
     void PublishCycle(int frozen, int skippedAudio, int skippedCritical, int skippedSmall,
                       uint64_t hotBytes, uint64_t savedBytes, uint64_t cycleMs,
                       double ingressMBps);
 
     VramPool* pool_ = nullptr;
+    StorageBridge* bridge_ = nullptr;
 
     std::thread monitor_;
     std::atomic<bool> stop_{ false };
@@ -164,4 +176,5 @@ private:
     std::vector<uint64_t> sliceFill_;
     uint32_t nextSlice_ = 0;
     uint64_t cryoUsed_ = 0;
+    uint64_t mirrorUsed_ = 0;
 };

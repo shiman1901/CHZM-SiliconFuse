@@ -748,10 +748,13 @@ LRESULT MainWindow::Dispatch(UINT msg, WPARAM wParam, LPARAM lParam)
         return TRUE;
 
     case WM_ENDSESSION:
+        // Fail-safe: never leave a frozen process behind on logoff/shutdown.
+        if (wParam && cryo_) cryo_->RestoreAllFrozen();
         if (wParam) ExitProcess(0);
         return 0;
 
     case WM_DESTROY:
+        if (cryo_) cryo_->RestoreAllFrozen();
         RemoveTrayIcon();
         PostQuitMessage(0);
         return 0;

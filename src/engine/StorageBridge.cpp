@@ -1,5 +1,6 @@
 #include "StorageBridge.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -52,8 +53,78 @@ void StorageBridge::Shutdown()
         fclose(file_);
         file_ = nullptr;
     }
+    {
+        std::lock_guard<std::mutex> mirrorLock(mirrorMutex_);
+        if (mirror_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(mirror_);
+            mirror_ = INVALID_HANDLE_VALUE;
+        }
+    }
     buffer_.clear();
     buffer_.shrink_to_fit();
+}
+
+bool StorageBridge::InitCryoMirror(const std::wstring& directory, uint64_t capacityBytes)
+{
+    std::lock_guard<std::mutex> lock(mirrorMutex_);
+    if (mirror_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(mirror_);
+        mirror_ = INVALID_HANDLE_VALUE;
+    }
+    mirrorPath_ = directory + L"\\cryo_mirror.bin";
+    mirrorCapacity_ = capacityBytes;
+    mirrorBytes_.store(0);
+    mirror_ = CreateFileW(mirrorPath_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    return mirror_ != INVALID_HANDLE_VALUE;
+}
+
+bool StorageBridge::WriteMirror(uint64_t offset, const void* data, uint64_t bytes)
+{
+    if (mirror_ == INVALID_HANDLE_VALUE || !data || bytes == 0) return false;
+    if (offset + bytes > mirrorCapacity_) return false;
+
+    std::lock_guard<std::mutex> lock(mirrorMutex_);
+    LARGE_INTEGER position{};
+    position.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(mirror_, position, nullptr, FILE_BEGIN)) return false;
+
+    const uint8_t* source = static_cast<const uint8_t*>(data);
+    uint64_t remaining = bytes;
+    while (remaining > 0) {
+        const DWORD chunk = (DWORD)std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull);
+        DWORD written = 0;
+        if (!WriteFile(mirror_, source, chunk, &written, nullptr) || written == 0) {
+            return false;
+        }
+        source += written;
+        remaining -= written;
+    }
+    if (offset + bytes > mirrorBytes_.load()) mirrorBytes_.store(offset + bytes);
+    return true;
+}
+
+bool StorageBridge::ReadMirror(uint64_t offset, void* dst, uint64_t bytes)
+{
+    if (mirror_ == INVALID_HANDLE_VALUE || !dst || bytes == 0) return false;
+    if (offset + bytes > mirrorBytes_.load()) return false;
+
+    std::lock_guard<std::mutex> lock(mirrorMutex_);
+    LARGE_INTEGER position{};
+    position.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(mirror_, position, nullptr, FILE_BEGIN)) return false;
+
+    uint8_t* target = static_cast<uint8_t*>(dst);
+    uint64_t remaining = bytes;
+    while (remaining > 0) {
+        const DWORD chunk = (DWORD)std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull);
+        DWORD read = 0;
+        if (!ReadFile(mirror_, target, chunk, &read, nullptr) || read == 0) return false;
+        target += read;
+        remaining -= read;
+    }
+    return true;
 }
 
 bool StorageBridge::ReadFromStaging(uint64_t offset, void* dst, size_t length)

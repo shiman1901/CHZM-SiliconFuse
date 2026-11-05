@@ -244,6 +244,35 @@ a 249 ms write-back of known-good bytes.
 Reproduction: `CHZM_SiliconFuse.exe --torture-test`, output in
 `docs/STAGE8_BENCHMARK_MATRIX.txt`.
 
+### 5.2 Fail-safe recovery, Stage 9
+
+Hibernating a live process into VRAM creates a single point of failure: the
+moment a game or the driver needs the aperture, the slices are gone. The engine
+therefore keeps a second copy.
+
+- Every chunk streamed into a slice is also written synchronously to a
+  disk-backed mirror in `StorageBridge` (`cryo_mirror.bin`, 4 GB).
+- Restore tries VRAM first, verifies the AVX2 checksum, and silently rebuilds
+  any region that fails from the mirror. Only proven bytes reach
+  `WriteProcessMemory`.
+- `NtResumeProcess` is withheld if a region cannot be proven from either
+  source: the process stays suspended and the failure is logged as CRITICAL.
+- The destructor and the window shutdown paths call `RestoreAllFrozen()`, so no
+  orphaned suspended process can outlive the engine.
+
+Measured on the reference platform:
+
+| Scenario | Outcome |
+|---|---|
+| 512 MB, exact accounting | 492.03 ms total, phases + overhead match to 0.00 ms |
+| 1024 MB, exact accounting | 930.68 ms total, phases + overhead match to 0.00 ms |
+| 3 concurrent victims (64/128/256) | 3/3, +307 MB RAM, 100% after shuffled restore |
+| Full VRAM eviction while frozen | 13/13 regions from the mirror, checksum MATCH, 182.61 ms, 100% |
+| Exit auto-restore | 1/1 resumed, 0 orphans, 100% |
+
+The mirror raises freeze cost from 190 ms to 492 ms at 512 MB; that is the
+price of surviving a TDR, and it is paid once per freeze, not per restore.
+
 ---
 
 ## 6. Security and governance

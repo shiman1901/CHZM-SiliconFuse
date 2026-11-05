@@ -93,6 +93,10 @@ public:
     bool ReadCryoDmaInto(uint64_t offset, uint64_t bytes, void* dst, double& mbps);
     // One log line with framebuffer, BAR1, DXGI and DMA counters.
     void LogSensors(const wchar_t* tag);
+    // Fault-injection hook for Stage 9: evicts every slice to the bridge.
+    bool EvictAllSlices(double& ms);
+    // Fail-safe mirror access (owned by the bridge).
+    StorageBridge* Bridge() const { return bridge_; }
 
 private:
     bool CreateDevice();

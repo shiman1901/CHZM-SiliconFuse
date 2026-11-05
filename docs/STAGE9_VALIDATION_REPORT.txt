@@ -1,0 +1,122 @@
+﻿CHZM//SILICONFUSE  STAGE 9  VALIDATION REPORT
+generated=2026-11-05 16:09:27
+mode=torture (fail-safe validation)
+
+[TEST 1: BUILD + EMBEDDED ICON]
+  exe_size_bytes  = 1041302
+  rt_group_icon   = PRESENT (id 1)
+  mirror_capacity = 4096 MB (disk-backed fail-safe)
+
+[TEST 2: POOL + COMMITGUARD + RAW BANDWIDTH]
+  adapter_vram_mb = 11964
+  pool_mb         = 4096
+  slices          = 4 x 1024 MB
+  commit_free_mb  = 21314 (floor 6144)
+  avx2_vram_write_mbps = 10843.8 (5.90 ms / 64 MB)
+  gpu_dma_read_mbps = 6225.9
+  avx2_hash_ms_64mb = 1.78 (35.2 GB/s, hash=6451794913016362337)
+
+[TEST A: EXACT TIMER ACCOUNTING (512 MB & 1024 MB)]
+  --- 512 MB ---
+  frozen = 1
+  total_ms                   492.03
+    suspend_ms                20.46
+    scan_zero_ms               2.05
+    rpm_read_ms               45.77
+    avx2_vram_write_ms        47.17
+    mirror_write_ms          292.98
+    hash_ms                   15.37
+    reset_trim_ms             48.46
+    sum(phases)              472.26
+    overhead_ms               19.77
+    sum+overhead             492.03 (delta 0.00, must be < 0.1)
+  frozen                 512 MB in 13 regions
+  zeroed_mb = 512
+  restored = 1 (mirror regions 0)
+  total_ms                   468.43
+    dma_gpu_ms                64.93
+    fallback_ms                0.00
+    hash_verify_ms            14.37
+    wpm_write_ms             380.32
+    resume_ms                  2.94
+    sum(phases)              462.56
+    overhead_ms                5.88
+    sum+overhead             468.43 (delta 0.00, must be < 0.1)
+  victim_bit_match = 100.0000%
+
+  --- 1024 MB ---
+  frozen = 1
+  total_ms                   930.68
+    suspend_ms                20.60
+    scan_zero_ms               2.99
+    rpm_read_ms               89.71
+    avx2_vram_write_ms        94.24
+    mirror_write_ms          575.98
+    hash_ms                   30.59
+    reset_trim_ms             96.81
+    sum(phases)              910.93
+    overhead_ms               19.76
+    sum+overhead             930.68 (delta 0.00, must be < 0.1)
+  frozen                 1024 MB in 6 regions
+  zeroed_mb = 1024
+  restored = 1 (mirror regions 0)
+  total_ms                  1199.94
+    dma_gpu_ms               127.93
+    fallback_ms                0.00
+    hash_verify_ms            29.38
+    wpm_write_ms            1033.53
+    resume_ms                  3.06
+    sum(phases)             1193.90
+    overhead_ms                6.04
+    sum+overhead            1199.94 (delta 0.00, must be < 0.1)
+  victim_bit_match = 100.0000%
+
+
+[TEST B: MULTI-PROCESS CONCURRENT CRYOSWAP (3 VICTIMS)]
+  victims_frozen   = 3 / 3
+  freeze_total_ms  = 521.89
+  zeroed_total_mb  = 448
+  avail_ram_before = 7462 MB
+  avail_ram_after  = 7769 MB
+  avail_ram_delta  = 307 MB
+
+  victim  256 MB: restored=1 total=176.54 ms dma=32.12 wpm=128.48 bit_match=100.0000%
+  victim   64 MB: restored=1 total=38.17 ms dma=9.26 wpm=18.46 bit_match=100.0000%
+  victim  128 MB: restored=1 total=77.26 ms dma=16.40 wpm=48.52 bit_match=100.0000%
+
+[TEST C: VRAM EVICTION SURVIVAL (FAULT-TOLERANCE PROOF)]
+  frozen           = 1 (256 MB, 13 regions)
+  zeroed_mb        = 256
+  vram_evicted     = 1 (83.25 ms, all 4 slices released)
+  resident_slices  = 0 / 4 after eviction
+  restored         = 1
+  mirror_regions   = 13 (256 MB read from StorageBridge)
+  dma_regions      = 13
+  checksum         = MATCH
+  fallback_ms      = 33.27
+  total_ms         = 182.61
+  victim_bit_match = 100.0000%
+  pool_rebuilt     = 3 slices resident
+
+[TEST 6: COMMITGUARD]
+  free_commit_mb  = 22692 (floor 6144)
+  resize_2048_mb  = 2 slices
+  resize_4096_mb  = 4 slices
+
+[TEST 7: SENSORS + STANDBY PURGE + EXIT SAFETY]
+  nvml_fb_used_mb   = 4149 / 11964
+  nvml_bar1_used_mb = 16355 / 16384
+  dxgi_local_used_mb= 3080
+  standby_purge     = unavailable (needs admin)
+  frozen_processes  = 0
+  mirror_bytes_used = 1024 MB
+  pool_end_mb       = 4096
+
+[TEST 8: EXIT SAFETY (RestoreAllFrozen)]
+  frozen           = 1
+  restore_all_frozen = 1
+  process_alive    = 1 (resumed by the exit path)
+  frozen_left      = 0
+  victim_bit_match = 100.0000%
+
+RESULT: STAGE 9 VALIDATION FINISHED

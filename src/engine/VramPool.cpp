@@ -863,8 +863,7 @@ bool VramPool::ReadCryoDmaInto(uint64_t offset, uint64_t bytes, void* dst,
     return true;
 }
 
-void VramPool::LogSensors(const wchar_t* tag)
-{
+void VramPool::LogSensors(const wchar_t* tag){
     uint64_t bar1Used = 0, bar1Total = 0;
     const bool haveBar1 = QueryNvmlBar1(bar1Used, bar1Total);
     uint64_t freeBytes = 0;
@@ -878,6 +877,17 @@ void VramPool::LogSensors(const wchar_t* tag)
         (unsigned long long)(haveBar1 ? bar1Used / kMb : 0),
         (unsigned long long)(haveBar1 ? bar1Total / kMb : 0),
         (unsigned long long)(usage / kMb), lastDmaMBps_);
+}
+
+bool VramPool::EvictAllSlices(double& ms)
+{
+    if (!monitorRunning_) {
+        const bool ok = EvictAll(ms);
+        PublishStats();
+        return ok;
+    }
+    RequestEvictAll();
+    return true;
 }
 
 PoolStats VramPool::GetStats() const

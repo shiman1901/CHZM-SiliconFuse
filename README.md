@@ -294,6 +294,7 @@ hardware state beyond its own resources.
 | 6 | CommitGuard, StandbyPurge, BAR1 telemetry (this release) | Pool never eats the WDDM commit reserve |
 | 7 | Honest GDDR6 hibernation: MEM_RESET -> DMA -> WriteProcessMemory (this release) | 512 MB returns 100% bit-for-bit after the RAM copy is wiped |
 | 8 | AVX2 checksum, sub-timers, 64/128/256/512 MB matrix (this release) | 512 MB hash < 15 ms, full restore < 350 ms |
+| 9 | Fail-safe mirror, eviction survival, exit auto-restore (this release) | 100% recovery after full VRAM eviction and a wiped RAM copy |
 
 Phase 1 and later require either an NVIDIA cooperation agreement or an
 exclusive-compute configuration in which the display driver is not bound to
@@ -407,3 +408,42 @@ buffer after resume: **100.0000% bit-for-bit**.
   pays 249 ms of write-back instead and keeps the bytes in VRAM.
 - `StandbyPurge` needs `SE_PROF_SINGLE_PROCESS`; without an elevated token the
   call is a logged no-op.
+
+---
+
+## 11. Stage 9: fail-safe recovery
+
+Frozen pages are never stored in one place only. Every chunk written into a
+GDDR6 slice is also written, synchronously, into a disk-backed mirror owned by
+`StorageBridge` (`cryo_mirror.bin`, 4 GB sparse). The mirror costs throughput at
+freeze time but it is the only thing that survives a TDR, a driver reset or a
+game taking the VRAM back.
+
+Restore is a two-source state machine:
+
+1. try the copy engine from VRAM;
+2. verify the AVX2 checksum of the region;
+3. on any failure (slice evicted, DMA refused, checksum mismatch) rebuild that
+   region from the mirror and verify again;
+4. only a region proven byte-for-byte is written back with
+   `WriteProcessMemory`;
+5. `NtResumeProcess` is **never** issued for a process whose data could not be
+   proven — the process stays suspended and the event is logged as CRITICAL.
+
+### 11.1 Measured validation (`--torture-test`, 2026-11-05)
+
+| Test | Result |
+|---|---|
+| Exact timer accounting 512 MB | sum(phases) + overhead = 492.03 ms, delta 0.00 |
+| Exact timer accounting 1024 MB | sum(phases) + overhead = 930.68 ms, delta 0.00 |
+| Three victims (64/128/256 MB) frozen at once | 3/3, +307 MB available RAM, all 100.0000% after shuffled restore |
+| VRAM fully evicted while frozen | 13/13 regions recovered from the mirror, checksum MATCH, 100.0000%, 182.61 ms |
+| Exit path (`RestoreAllFrozen`) | 1/1 resumed, 0 left frozen, 100.0000% |
+
+Sub-timers for 512 MB freeze: suspend 20.46, region scan 2.05,
+`ReadProcessMemory` 45.77, AVX2 into BAR1 47.17, **mirror write 292.98**,
+checksum 15.37, `MEM_RESET`+trim 48.46, overhead 19.77.
+
+The mirror is the new freeze bottleneck (1.8 GB/s of synchronous disk I/O). It
+is written with `WriteFile` into the OS cache, so a process crash still leaves a
+consistent file; an asynchronous variant is the obvious next optimisation.

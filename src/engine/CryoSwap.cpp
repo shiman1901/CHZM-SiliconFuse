@@ -5,6 +5,7 @@
 #include "CommitGuard.h"
 #include "Hash64.h"
 #include "StandbyPurge.h"
+#include "StorageBridge.h"
 #include "VramPool.h"
 
 #include <audiopolicy.h>
@@ -309,10 +310,11 @@ bool CryoSwap::EnablePrivileges()
     return all;
 }
 
-bool CryoSwap::Init(VramPool* pool)
+bool CryoSwap::Init(VramPool* pool, StorageBridge* bridge)
 {
     pool_ = pool;
-    return pool_ != nullptr;
+    bridge_ = bridge;
+    return pool_ != nullptr && bridge_ != nullptr;
 }
 
 void CryoSwap::Shutdown()
@@ -343,9 +345,10 @@ void CryoSwap::SetEnabled(bool on)
 
 bool CryoSwap::IsCritical(const std::wstring& name) const { return IsBlockedName(name); }
 
-// Spreads cached pages evenly over the slices (round-robin per 16 MB chunk),
-// so a 512 MB freeze lands as 128 MB in each of the four slices.
-bool CryoSwap::PlaceChunk(uint32_t bytes, uint64_t& vramOffset)
+// Spreads cached pages evenly over the slices (round-robin per chunk), and
+// skips slices that were evicted while we were copying, so a partially
+// evicted pool never aborts a freeze.
+bool CryoSwap::PlaceAndWrite(const uint8_t* data, uint32_t bytes, uint64_t& vramOffset)
 {
     const uint32_t count = pool_ ? pool_->SliceCount() : 0;
     const uint64_t sliceBytes = pool_ ? pool_->SliceBytes() : 0;
@@ -354,11 +357,12 @@ bool CryoSwap::PlaceChunk(uint32_t bytes, uint64_t& vramOffset)
 
     for (uint32_t attempt = 0; attempt < count; ++attempt) {
         const uint32_t slice = (nextSlice_++) % count;
-        if (sliceFill_[slice] + bytes <= sliceBytes) {
-            vramOffset = (uint64_t)slice * sliceBytes + sliceFill_[slice];
-            sliceFill_[slice] += bytes;
-            return true;
-        }
+        if (sliceFill_[slice] + bytes > sliceBytes) continue;
+        const uint64_t offset = (uint64_t)slice * sliceBytes + sliceFill_[slice];
+        if (!StreamWrite(offset, data, bytes)) continue;
+        sliceFill_[slice] += bytes;
+        vramOffset = offset;
+        return true;
     }
     return false;
 }
@@ -419,6 +423,8 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     MEMORY_BASIC_INFORMATION info{};
     const uint8_t* address = nullptr;
     const uint8_t* limit = reinterpret_cast<const uint8_t*>(0x7FFFFFFF0000ull);
+    Timer scanTimer;
+    scanTimer.Begin();
     while (address < limit && planned < kMaxFreezePerProcess) {
         if (VirtualQueryEx(process, address, &info, sizeof(info)) != sizeof(info)) break;
         const uint8_t* base = static_cast<const uint8_t*>(info.BaseAddress);
@@ -435,6 +441,7 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
         address = base + size;
         if (address <= base) break;
     }
+    result.scanZeroMs = scanTimer.Ms();
 
     if (regions.empty()) {
         ResumeProcess(process);
@@ -474,15 +481,29 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
 
             stepTimer.Begin();
             uint64_t vramOffset = 0;
-            const bool placed = PlaceChunk((uint32_t)read, vramOffset) &&
-                                StreamWrite(vramOffset, bounce.data(), (size_t)read);
+            const bool placed = PlaceAndWrite(bounce.data(), (uint32_t)read, vramOffset);
             result.vramWriteMs += stepTimer.Ms();
             if (!placed) {
                 ingressOk = false;
                 break;
             }
+
+            // Fail-safe mirror. Without it an evicted slice or a TDR would
+            // destroy the only copy of a frozen process.
+            stepTimer.Begin();
+            const uint64_t mirrorOffset = mirrorUsed_;
+            const bool mirrored =
+                bridge_->WriteMirror(mirrorOffset, bounce.data(), (size_t)read);
+            result.mirrorWriteMs += stepTimer.Ms();
+            if (!mirrored) {
+                ingressOk = false;
+                break;
+            }
+            mirrorUsed_ += read;
+
             CachedChunk placedChunk;
             placedChunk.vramOffset = vramOffset;
+            placedChunk.mirrorOffset = mirrorOffset;
             placedChunk.bytes = (uint32_t)read;
             region.chunks.push_back(placedChunk);
 
@@ -493,7 +514,8 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
         regionHashes.push_back(region.hash);
         if (!ingressOk) break;
     }
-    result.ingressMs = result.rpmReadMs + result.vramWriteMs + result.hashMs;
+    result.ingressMs = result.rpmReadMs + result.vramWriteMs + result.hashMs +
+                       result.mirrorWriteMs;
     result.origHash = CombineHashes(regionHashes);
     result.bytes = written;
     result.regions = (int)regions.size();
@@ -538,13 +560,19 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
 
     result.ok = true;
     result.totalMs = totalTimer.Ms();
-    Log(L"[cryo] frozen pid=%lu ws=%.0f->%.0f MB gddr6=%llu MB regions=%d threads=%d "
-        L"suspend=%.1f rpm=%.1f vram=%.1f hash=%.1f trim=%.1f total=%.1f ms",
+    result.overheadMs = result.totalMs -
+                        (result.suspendMs + result.scanZeroMs + result.rpmReadMs +
+                         result.vramWriteMs + result.mirrorWriteMs + result.hashMs +
+                         result.resetTrimMs);
+    Log(L"[cryo] frozen pid=%lu ws=%.0f->%.0f MB gddr6=%llu MB mirror=%llu MB regions=%d "
+        L"threads=%d suspend=%.2f scan=%.2f rpm=%.2f vram=%.2f mirror_w=%.2f hash=%.2f "
+        L"trim=%.2f overhead=%.2f total=%.2f ms",
         (unsigned long)pid, (double)result.wsBefore / (1024.0 * 1024.0),
         (double)result.wsAfter / (1024.0 * 1024.0),
-        (unsigned long long)(written / kMb), result.regions, result.threads,
-        result.suspendMs, result.rpmReadMs, result.vramWriteMs, result.hashMs,
-        result.resetTrimMs, result.totalMs);
+        (unsigned long long)(written / kMb), (unsigned long long)(written / kMb),
+        result.regions, result.threads, result.suspendMs, result.scanZeroMs,
+        result.rpmReadMs, result.vramWriteMs, result.mirrorWriteMs, result.hashMs,
+        result.resetTrimMs, result.overheadMs, result.totalMs);
     // Handles stay open across the suspend window on purpose: the process is
     // suspended, we keep nothing after this function.
     CloseHandle(process);
@@ -583,6 +611,51 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
     std::vector<uint8_t> staging((size_t)kChunk);
     std::vector<uint64_t> restoredHashes;
     uint64_t restored = 0;
+    bool failSafe = false;
+
+    // One region either from the GDDR6 slices or from the fail-safe mirror.
+    auto restoreRegion = [&](const CachedRegion& region, bool fromMirror,
+                             uint64_t& bytesOut, uint64_t& hashOut) -> bool {
+        Hash64 regionHash;
+        uint64_t regionOffset = 0;
+        bytesOut = 0;
+        for (const CachedChunk& chunk : region.chunks) {
+            bool got = false;
+            if (fromMirror) {
+                stepTimer.Begin();
+                got = bridge_->ReadMirror(chunk.mirrorOffset, staging.data(), chunk.bytes);
+                result.fallbackMs += stepTimer.Ms();
+                if (got) result.mirrorBytes += chunk.bytes;
+            } else {
+                double chunkMbps = 0.0;
+                stepTimer.Begin();
+                got = pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes,
+                                             staging.data(), chunkMbps);
+                result.dmaGpuMs += stepTimer.Ms();
+                if (got && chunkMbps > result.dmaMBps) result.dmaMBps = chunkMbps;
+            }
+            if (!got) return false;
+
+            stepTimer.Begin();
+            regionHash.Update(staging.data(), chunk.bytes);
+            result.hashVerifyMs += stepTimer.Ms();
+
+            SIZE_T wrote = 0;
+            stepTimer.Begin();
+            const bool writeOk =
+                WriteProcessMemory(process,
+                                   reinterpret_cast<void*>(region.address + regionOffset),
+                                   staging.data(), (SIZE_T)chunk.bytes, &wrote) != FALSE &&
+                wrote == chunk.bytes;
+            result.wpmWriteMs += stepTimer.Ms();
+            if (!writeOk) return false;
+
+            regionOffset += chunk.bytes;
+            bytesOut += chunk.bytes;
+        }
+        hashOut = regionHash.Final();
+        return true;
+    };
 
     for (const CachedRegion& region : entry.regions) {
         bool undone = false;
@@ -597,60 +670,59 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
         if (undone) {
             ++result.undoRegions;
             restored += region.size;
+            restoredHashes.push_back(region.hash);
             continue;
         }
 
         ++result.dmaRegions;
-        Hash64 regionHash;
-        uint64_t regionOffset = 0;
-        for (const CachedChunk& chunk : region.chunks) {
-            double chunkMbps = 0.0;
-            stepTimer.Begin();
-            const bool dmaOk = pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes,
-                                                      staging.data(), chunkMbps);
-            result.dmaGpuMs += stepTimer.Ms();
-            if (!dmaOk) {
-                result.checksumOk = false;
+        uint64_t bytes = 0;
+        uint64_t hash = 0;
+        bool ok = restoreRegion(region, false, bytes, hash);
+        if (!ok || hash != region.hash) {
+            // Either the slice was evicted (a game grabbed the VRAM) or the
+            // copy engine returned unexpected bytes. Rebuild from the mirror.
+            ++result.mirrorRegions;
+            bytes = 0;
+            hash = 0;
+            ok = restoreRegion(region, true, bytes, hash);
+            if (!ok || hash != region.hash) {
+                Log(L"[cryo] pid=%lu region 0x%llX unrecoverable: vram and mirror "
+                    L"both failed the checksum", (unsigned long)pid,
+                    (unsigned long long)region.address);
+                failSafe = true;
                 break;
             }
-            if (chunkMbps > result.dmaMBps) result.dmaMBps = chunkMbps;
-
-            stepTimer.Begin();
-            regionHash.Update(staging.data(), chunk.bytes);
-            result.hashVerifyMs += stepTimer.Ms();
-
-            SIZE_T wrote = 0;
-            stepTimer.Begin();
-            const bool writeOk =
-                WriteProcessMemory(process,
-                                   reinterpret_cast<void*>(region.address + regionOffset),
-                                   staging.data(), (SIZE_T)chunk.bytes, &wrote) != FALSE &&
-                wrote == chunk.bytes;
-            result.wpmWriteMs += stepTimer.Ms();
-            if (!writeOk) {
-                result.checksumOk = false;
-                break;
-            }
-            regionOffset += chunk.bytes;
-            restored += chunk.bytes;
         }
-        restoredHashes.push_back(regionHash.Final());
-        if (restoredHashes.back() != region.hash) {
-            result.checksumOk = false;
-            Log(L"[cryo] pid=%lu region 0x%llX checksum mismatch", (unsigned long)pid,
-                (unsigned long long)region.address);
-        }
+        restored += bytes;
+        restoredHashes.push_back(hash);
     }
 
     result.restoredHash = CombineHashes(restoredHashes);
+    result.bytes = restored;
+
+    if (failSafe) {
+        // Invariant: never resume a process onto pages we could not prove.
+        result.checksumOk = false;
+        result.ok = false;
+        result.totalMs = timer.Ms();
+        result.overheadMs = result.totalMs -
+                            (result.dmaGpuMs + result.fallbackMs + result.hashVerifyMs +
+                             result.wpmWriteMs + result.resumeMs);
+        CloseHandle(process);
+        Log(L"[cryo] CRITICAL pid=%lu restore aborted, process left suspended",
+            (unsigned long)pid);
+        return false;
+    }
 
     stepTimer.Begin();
     ResumeProcess(process);
     CloseHandle(process);
     result.resumeMs += stepTimer.Ms();
 
-    result.bytes = restored;
     result.totalMs = timer.Ms();
+    result.overheadMs = result.totalMs -
+                        (result.dmaGpuMs + result.fallbackMs + result.hashVerifyMs +
+                         result.wpmWriteMs + result.resumeMs);
     result.ok = result.checksumOk;
 
     {
@@ -658,11 +730,13 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
         stats_.lastWakeMs = result.totalMs;
         stats_.lastEgressMBps = result.dmaMBps;
     }
-    Log(L"[cryo] restored pid=%lu %llu MB in %.2f ms (dma=%.1f hash=%.2f wpm=%.1f "
-        L"resume=%.1f dmaRegions=%d undo=%d checksum=%ls)",
+    Log(L"[cryo] restored pid=%lu %llu MB in %.2f ms (dma=%.2f fallback=%.2f hash=%.2f "
+        L"wpm=%.2f resume=%.2f overhead=%.2f dmaRegions=%d mirrorRegions=%d undo=%d "
+        L"checksum=%ls)",
         (unsigned long)pid, (unsigned long long)(restored / kMb), result.totalMs,
-        result.dmaGpuMs, result.hashVerifyMs, result.wpmWriteMs, result.resumeMs,
-        result.dmaRegions, result.undoRegions, result.checksumOk ? L"MATCH" : L"MISMATCH");
+        result.dmaGpuMs, result.fallbackMs, result.hashVerifyMs, result.wpmWriteMs,
+        result.resumeMs, result.overheadMs, result.dmaRegions, result.mirrorRegions,
+        result.undoRegions, result.checksumOk ? L"MATCH" : L"MISMATCH");
     return result.ok;
 }
 
@@ -798,7 +872,7 @@ int CryoSwap::RunCycle(DWORD onlyPid)
     return frozen;
 }
 
-int CryoSwap::Reset()
+int CryoSwap::RestoreAllFrozen()
 {
     std::vector<DWORD> pids;
     {
@@ -811,6 +885,12 @@ int CryoSwap::Reset()
         RestoreResult result;
         if (CryoRestore(pid, false, result)) ++restored;
     }
+    return restored;
+}
+
+int CryoSwap::Reset()
+{
+    const int restored = RestoreAllFrozen();
 
     {
         std::lock_guard<std::mutex> lock(cacheMutex_);
@@ -818,6 +898,7 @@ int CryoSwap::Reset()
     }
     sliceFill_.clear();
     nextSlice_ = 0;
+    mirrorUsed_ = 0;
 
     std::lock_guard<std::mutex> lock(statsMutex_);
     stats_.savedBytes = 0;
