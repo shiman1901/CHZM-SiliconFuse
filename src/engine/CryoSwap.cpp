@@ -26,6 +26,10 @@
 #ifndef QUOTA_LIMITS_HARDWS_MAX_ENABLE
 #define QUOTA_LIMITS_HARDWS_MAX_ENABLE 0x00000004
 #endif
+#ifndef QUOTA_LIMITS_HARDWS_MIN_DISABLE
+#define QUOTA_LIMITS_HARDWS_MIN_DISABLE 0x00000002
+#define QUOTA_LIMITS_HARDWS_MAX_DISABLE 0x00000008
+#endif
 
 namespace {
 
@@ -924,100 +928,209 @@ void CryoSwap::PublishCycle(int frozen, int skippedAudio, int skippedCritical,
     stats_.lastIngressMBps = ingressMBps;
 }
 
-bool CryoSwap::TrimProcess(DWORD pid, const std::wstring& name, HANDLE process,
-                           TrimmedProcess& out)
-{
-    PROCESS_MEMORY_COUNTERS before{};
-    if (!GetProcessMemoryInfo(process, &before, sizeof(before))) return false;
+namespace {
 
+constexpr uint32_t kMemoryPriorityNormal = 5;
+constexpr uint32_t kMemoryPriorityLow = 2;
+constexpr uint32_t kMemoryPriorityVeryLow = 1;
+
+struct MemoryPriorityInfo {
+    ULONG MemoryPriority;
+};
+
+// PROCESS_MEMORY_COUNTERS_EX2 is not in MinGW headers.
+struct MemoryCountersEx2 {
+    PROCESS_MEMORY_COUNTERS_EX ex;
+    SIZE_T privateWorkingSet;
+    ULONGLONG sharedCommitUsage;
+};
+
+bool ReadMemoryCounters(HANDLE process, uint64_t& ws, uint64_t& privateWs,
+                        uint64_t& faults)
+{
+    MemoryCountersEx2 counters{};
+    counters.ex.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(process,
+                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                              sizeof(counters))) {
+        return false;
+    }
+    ws = counters.ex.WorkingSetSize;
+    privateWs = counters.privateWorkingSet;
+    faults = counters.ex.PageFaultCount;
+    return true;
+}
+
+bool ReadMemoryPriority(HANDLE process, uint32_t& value)
+{
+    MemoryPriorityInfo info{};
+    if (!GetProcessInformation(process, ProcessMemoryPriority, &info, sizeof(info))) {
+        return false;
+    }
+    value = info.MemoryPriority;
+    return true;
+}
+
+bool WriteMemoryPriority(HANDLE process, uint32_t value)
+{
+    MemoryPriorityInfo info{ value };
+    return SetProcessInformation(process, ProcessMemoryPriority, &info, sizeof(info)) != FALSE;
+}
+
+} // namespace
+
+bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE process,
+                               LiveTrimMode mode, TrimmedProcess& out)
+{
     out = TrimmedProcess{};
+    if (!ReadMemoryCounters(process, out.wsBefore, out.privateBefore, out.faultsBefore)) {
+        return false;
+    }
+
     out.pid = pid;
     out.name = name;
-    out.wsBefore = before.WorkingSetSize;
 
-    const std::vector<WIN32_MEMORY_RANGE_ENTRY> hot =
-        CollectHotRanges(process, kLiveHotBytes);
-    if (hot.empty()) return false;
-
-    AlignedBuffer bounce((size_t)kChunk);
-    if (!bounce.data) return false;
-
-    uint64_t written = 0;
-    for (const WIN32_MEMORY_RANGE_ENTRY& range : hot) {
-        out.ranges.push_back(range);
-        const uint8_t* source = static_cast<const uint8_t*>(range.VirtualAddress);
-        uint64_t remaining = range.NumberOfBytes;
-        while (remaining > 0) {
-            const uint64_t chunk = std::min(remaining, (uint64_t)kChunk);
-            SIZE_T read = 0;
-            if (!ReadProcessMemory(process, source, bounce.data, (SIZE_T)chunk, &read) ||
-                read == 0) {
-                break;
-            }
-            uint64_t vramOffset = 0;
-            if (!PlaceAndWrite(bounce.data, (uint32_t)read, vramOffset)) break;
-            CachedChunk placed;
-            placed.vramOffset = vramOffset;
-            placed.bytes = (uint32_t)read;
-            out.chunks.push_back(placed);
-            written += read;
-            source += read;
-            remaining -= read;
-        }
-    }
-    if (written == 0) return false;
-    out.bytes = written;
-
-    // Soft compression only: threads keep running, RAM stays the source of
-    // truth. No NtSuspendProcess, no MEM_RESET on a live application.
-    SetProcessWorkingSetSizeEx(process, kLiveQuotaMin, kLiveQuotaMax,
-                               QUOTA_LIMITS_HARDWS_MAX_ENABLE);
-    EmptyWorkingSet(process);
+    // Step 1: memory priority + EcoQoS. This is what keeps the foreground
+    // window fast without ever freezing a live thread.
+    uint32_t current = kMemoryPriorityNormal;
+    if (!ReadMemoryPriority(process, current)) current = kMemoryPriorityNormal;
+    out.priorityBefore = current;
+    const uint32_t target = (mode == LiveTrimMode::AggressiveReclaim)
+                                ? kMemoryPriorityVeryLow
+                                : kMemoryPriorityLow;
+    WriteMemoryPriority(process, target);
+    out.priorityApplied = target;
     ApplyEcoQos(process, true);
 
-    PROCESS_MEMORY_COUNTERS after{};
-    if (GetProcessMemoryInfo(process, &after, sizeof(after))) {
-        out.wsAfter = after.WorkingSetSize;
-    } else {
-        out.wsAfter = out.wsBefore;
+    // Step 2: non-destructive hot snapshot into GDDR6 (transport probe).
+    const std::vector<WIN32_MEMORY_RANGE_ENTRY> hot =
+        CollectHotRanges(process, kLiveHotBytes);
+    AlignedBuffer bounce((size_t)kChunk);
+    uint64_t copied = 0;
+    if (bounce.data) {
+        for (const WIN32_MEMORY_RANGE_ENTRY& range : hot) {
+            out.ranges.push_back(range);
+            const uint8_t* source = static_cast<const uint8_t*>(range.VirtualAddress);
+            uint64_t remaining = range.NumberOfBytes;
+            while (remaining > 0) {
+                const uint64_t chunk = std::min(remaining, (uint64_t)kChunk);
+                SIZE_T read = 0;
+                if (!ReadProcessMemory(process, source, bounce.data, (SIZE_T)chunk,
+                                       &read) ||
+                    read == 0) {
+                    break;
+                }
+                uint64_t vramOffset = 0;
+                if (!PlaceAndWrite(bounce.data, (uint32_t)read, vramOffset)) break;
+                CachedChunk placed;
+                placed.vramOffset = vramOffset;
+                placed.bytes = (uint32_t)read;
+                out.chunks.push_back(placed);
+                copied += read;
+                source += read;
+                remaining -= read;
+            }
+        }
     }
+    out.bytes = copied;
+
+    // Step 3: reclaim only on demand, and never with a hard working-set lock.
+    // EmptyWorkingSet pushes cold pages to the (now low priority) standby list,
+    // active JS timers keep their hot 15-30 MB without thrashing.
+    int64_t systemDelta = 0;
+    if (mode == LiveTrimMode::AggressiveReclaim) {
+        const uint64_t availBefore = AvailablePhysicalMb();
+        EmptyWorkingSet(process);
+        const uint64_t availAfter = AvailablePhysicalMb();
+        systemDelta = (int64_t)availAfter - (int64_t)availBefore;
+    }
+    out.systemDelta = systemDelta;
+
+    ReadMemoryCounters(process, out.wsAfter, out.privateAfter, out.faultsAfter);
     out.trimmedAt = GetTickCount64();
     return true;
 }
 
-int CryoSwap::WakeTrimmedEntry(const TrimmedProcess& entry, double& dmaMBps)
+void CryoSwap::RestoreLiveSettings(HANDLE process)
 {
-    HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
-                                     PROCESS_VM_READ,
-                                 FALSE, entry.pid);
-    if (!process) return 0;
-
-    SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0);
+    WriteMemoryPriority(process, kMemoryPriorityNormal);
     ApplyEcoQos(process, false);
-
-    AlignedBuffer staging((size_t)kChunk);
-    double best = 0.0;
-    if (staging.data) {
-        for (const CachedChunk& chunk : entry.chunks) {
-            double mbps = 0.0;
-            if (pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes, staging.data, mbps) &&
-                mbps > best) {
-                best = mbps;
-            }
-        }
-    }
-    if (!entry.ranges.empty()) {
-        PrefetchVirtualMemory(process, entry.ranges.size(),
-                              const_cast<WIN32_MEMORY_RANGE_ENTRY*>(entry.ranges.data()), 0);
-    }
-    CloseHandle(process);
-    dmaMBps = best;
-    return 1;
+    SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1,
+                               QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+                                   QUOTA_LIMITS_HARDWS_MAX_DISABLE);
 }
 
-// Live trim: never suspends, never discards RAM. Used by the GUI and the
-// autopilot on real applications.
-int CryoSwap::RunCycle(DWORD onlyPid)
+int CryoSwap::TrimPids(const std::vector<DWORD>& pids, LiveTrimMode mode)
+{
+    if (!pool_) return 0;
+
+    LiveMetrics metrics;
+    const uint64_t availBefore = AvailablePhysicalMb();
+    const int64_t commitUsedBefore =
+        (int64_t)(TotalCommitLimitMb() - FreeCommitMb());
+    Timer timer;
+    timer.Begin();
+
+    int count = 0;
+    for (DWORD pid : pids) {
+        if (!pid || pid == GetCurrentProcessId()) continue;
+        if (IsTrimmed(pid) || IsFrozen(pid)) continue;
+
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                         PROCESS_VM_READ | PROCESS_SET_QUOTA |
+                                         PROCESS_SET_INFORMATION,
+                                     FALSE, pid);
+        if (!process) continue;
+
+        const std::wstring name = BaseName(process);
+        TrimmedProcess trimmed;
+        if (TrimProcessLive(pid, name, process, mode, trimmed)) {
+            ++count;
+            if (trimmed.wsBefore > trimmed.wsAfter) {
+                metrics.trimmedWsSum += trimmed.wsBefore - trimmed.wsAfter;
+            }
+            if (trimmed.privateBefore > trimmed.privateAfter) {
+                metrics.trimmedPrivateWsSum +=
+                    trimmed.privateBefore - trimmed.privateAfter;
+            }
+            metrics.gddr6SnapshotBytes += trimmed.bytes;
+            metrics.systemAvailableDelta += trimmed.systemDelta;
+            if (trimmed.faultsAfter > trimmed.faultsBefore) {
+                metrics.hardFaultDelta += trimmed.faultsAfter - trimmed.faultsBefore;
+            }
+            std::lock_guard<std::mutex> lock(trimmedMutex_);
+            trimmed_.push_back(std::move(trimmed));
+        }
+        CloseHandle(process);
+    }
+
+    metrics.processes = count;
+    (void)availBefore; // per-process deltas are summed above
+    metrics.commitDelta =
+        (int64_t)(TotalCommitLimitMb() - FreeCommitMb()) - commitUsedBefore;
+    metrics.elapsedMs = (uint64_t)timer.Ms();
+
+    {
+        std::lock_guard<std::mutex> lock(statsMutex_);
+        liveMetrics_ = metrics;
+        stats_.trimmed = (int)trimmed_.size();
+        stats_.savedBytes += metrics.trimmedWsSum;
+        stats_.hotBytes += metrics.gddr6SnapshotBytes;
+    }
+
+    Log(L"[cryo] live trim (%ls): processes=%d ws_sum=%llu MB priv_sum=%llu MB "
+        L"sys_avail_delta=%lld MB commit_delta=%lld MB gddr6=%llu MB in %llu ms",
+        mode == LiveTrimMode::AggressiveReclaim ? L"aggressive" : L"autopilot",
+        count, (unsigned long long)(metrics.trimmedWsSum / kMb),
+        (unsigned long long)(metrics.trimmedPrivateWsSum / kMb),
+        (long long)(metrics.systemAvailableDelta),
+        (long long)(metrics.commitDelta / (int64_t)kMb),
+        (unsigned long long)(metrics.gddr6SnapshotBytes / kMb),
+        (unsigned long long)metrics.elapsedMs);
+    return count;
+}
+
+int CryoSwap::RunCycle(LiveTrimMode mode, DWORD onlyPid)
 {
     if (!pool_) return 0;
     std::unique_lock<std::mutex> guard(cycleMutex_, std::try_to_lock);
@@ -1028,9 +1141,6 @@ int CryoSwap::RunCycle(DWORD onlyPid)
         stats_.busy = true;
     }
 
-    Timer cycleTimer;
-    cycleTimer.Begin();
-
     if (AvailablePhysicalMb() < 1536) PurgeLowPriorityStandbyList();
 
     const std::set<DWORD> audio = CollectAudioPids();
@@ -1039,135 +1149,176 @@ int CryoSwap::RunCycle(DWORD onlyPid)
 
     std::vector<DWORD> pids(4096);
     DWORD needed = 0;
-    if (!EnumProcesses(pids.data(), (DWORD)(pids.size() * sizeof(DWORD)), &needed)) {
-        std::lock_guard<std::mutex> lock(statsMutex_);
-        stats_.busy = false;
-        return 0;
+    int result = 0;
+    if (EnumProcesses(pids.data(), (DWORD)(pids.size() * sizeof(DWORD)), &needed)) {
+        size_t count = needed / sizeof(DWORD);
+        if (count > pids.size()) count = pids.size();
+
+        std::vector<DWORD> candidates;
+        for (size_t i = 0; i < count; ++i) {
+            const DWORD pid = pids[i];
+            if (!pid || pid == 4 || pid == self) continue;
+            if (onlyPid != 0 && pid != onlyPid) continue;
+            if (pid == foreground) continue;
+            if (audio.count(pid)) continue;
+            if (IsTrimmed(pid) || IsFrozen(pid)) continue;
+
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                             PROCESS_VM_READ | PROCESS_SET_QUOTA,
+                                         FALSE, pid);
+            if (!process) continue;
+            const std::wstring name = BaseName(process);
+            PROCESS_MEMORY_COUNTERS counters{};
+            const bool have =
+                GetProcessMemoryInfo(process, &counters, sizeof(counters)) != FALSE;
+            CloseHandle(process);
+            if (!have) continue;
+            if (IsCritical(name)) continue;
+            if (counters.WorkingSetSize < kLiveMinWorkingSet) continue;
+            candidates.push_back(pid);
+        }
+        result = TrimPids(candidates, mode);
     }
-    size_t count = needed / sizeof(DWORD);
-    if (count > pids.size()) count = pids.size();
 
-    int trimmedCount = 0;
-    int skippedAudio = 0;
-    int skippedCritical = 0;
-    int skippedSmall = 0;
-    uint64_t hotBytes = 0;
-    uint64_t savedBytes = 0;
+    std::lock_guard<std::mutex> lock(statsMutex_);
+    stats_.busy = false;
+    return result;
+}
 
-    for (size_t i = 0; i < count && trimmedCount < kMaxTrimPerCycle; ++i) {
-        const DWORD pid = pids[i];
-        if (!pid || pid == 4 || pid == self) continue;
-        if (onlyPid != 0 && pid != onlyPid) continue;
-        if (pid == foreground) continue;
-        if (audio.count(pid)) { ++skippedAudio; continue; }
-        if (IsTrimmed(pid) || IsFrozen(pid)) continue;
+int CryoSwap::WakeTrimmedEntry(const TrimmedProcess& entry, double& dmaMBps)
+{
+    HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
+                                     PROCESS_VM_READ | PROCESS_SET_INFORMATION,
+                                 FALSE, entry.pid);
+    if (!process) return 0;
 
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
-                                         PROCESS_SET_QUOTA,
-                                     FALSE, pid);
-        if (!process) continue;
-
-        const std::wstring name = BaseName(process);
-        PROCESS_MEMORY_COUNTERS counters{};
-        const bool haveCounters =
-            GetProcessMemoryInfo(process, &counters, sizeof(counters)) != FALSE;
-
-        if (!haveCounters) {
-            CloseHandle(process);
-            continue;
-        }
-        if (IsCritical(name)) {
-            ++skippedCritical;
-            CloseHandle(process);
-            continue;
-        }
-        if (counters.WorkingSetSize < kLiveMinWorkingSet) {
-            ++skippedSmall;
-            CloseHandle(process);
-            continue;
-        }
-
-        TrimmedProcess trimmed;
-        if (TrimProcess(pid, name, process, trimmed)) {
-            ++trimmedCount;
-            hotBytes += trimmed.bytes;
-            if (trimmed.wsBefore > trimmed.wsAfter) {
-                savedBytes += trimmed.wsBefore - trimmed.wsAfter;
+    RestoreLiveSettings(process);
+    AlignedBuffer staging((size_t)kChunk);
+    double best = 0.0;
+    if (staging.data) {
+        for (const CachedChunk& chunk : entry.chunks) {
+            double mbps = 0.0;
+            if (pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes, staging.data,
+                                       mbps) &&
+                mbps > best) {
+                best = mbps;
             }
-            std::lock_guard<std::mutex> lock(trimmedMutex_);
-            trimmed_.push_back(std::move(trimmed));
         }
+    }
+    if (!entry.ranges.empty()) {
+        PrefetchVirtualMemory(process, entry.ranges.size(),
+                              const_cast<WIN32_MEMORY_RANGE_ENTRY*>(
+                                  entry.ranges.data()),
+                              0);
+    }
+    CloseHandle(process);
+    dmaMBps = best;
+    return 1;
+}
+
+// Fast path: settings first (sub-millisecond), then batch prefetch, then DMA.
+int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs)
+{
+    if (!pool_) return 0;
+
+    std::vector<TrimmedProcess> group;
+    {
+        std::lock_guard<std::mutex> lock(trimmedMutex_);
+        for (DWORD pid : pids) {
+            for (auto it = trimmed_.begin(); it != trimmed_.end(); ++it) {
+                if (it->pid == pid) {
+                    group.push_back(*it);
+                    trimmed_.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+
+    Timer settingsTimer;
+    settingsTimer.Begin();
+    for (const TrimmedProcess& entry : group) {
+        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
+                                     PROCESS_SET_INFORMATION,
+                                 FALSE, entry.pid);
+        if (!process) continue;
+        RestoreLiveSettings(process);
         CloseHandle(process);
     }
+    restoreSettingsMs = settingsTimer.Ms();
 
-    const uint64_t cycleMs = (uint64_t)cycleTimer.Ms();
-    {
-        std::lock_guard<std::mutex> lock(statsMutex_);
-        stats_.savedBytes += savedBytes;
-        stats_.hotBytes += hotBytes;
-        stats_.lastCycleMs = cycleMs;
-        stats_.skippedAudio += skippedAudio;
-        stats_.skippedCritical += skippedCritical;
-        stats_.skippedSmall += skippedSmall;
-        stats_.trimmed = (int)trimmed_.size();
-        stats_.busy = false;
+    AlignedBuffer staging((size_t)kChunk);
+    double bestMbps = 0.0;
+    for (const TrimmedProcess& entry : group) {
+        HANDLE process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+                                     FALSE, entry.pid);
+        if (process) {
+            if (!entry.ranges.empty()) {
+                PrefetchVirtualMemory(process, entry.ranges.size(),
+                                      const_cast<WIN32_MEMORY_RANGE_ENTRY*>(
+                                          entry.ranges.data()),
+                                      0);
+            }
+            CloseHandle(process);
+        }
+        if (staging.data && !entry.chunks.empty()) {
+            double mbps = 0.0;
+            const CachedChunk& probe = entry.chunks.front();
+            if (pool_->ReadCryoDmaInto(probe.vramOffset, probe.bytes, staging.data,
+                                       mbps) &&
+                mbps > bestMbps) {
+                bestMbps = mbps;
+            }
+        }
     }
 
-    Log(L"[cryo] live trim: trimmed=%d hot=%llu MB saved=%llu MB audio=%d critical=%d "
-        L"small=%d in %llu ms",
-        trimmedCount, (unsigned long long)(hotBytes / kMb),
-        (unsigned long long)(savedBytes / kMb), skippedAudio, skippedCritical,
-        skippedSmall, (unsigned long long)cycleMs);
-    return trimmedCount;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex_);
+        liveMetrics_.restoreSettingsMs = restoreSettingsMs;
+        stats_.lastWakeMs = restoreSettingsMs;
+        stats_.lastEgressMBps = bestMbps;
+        stats_.trimmed = (int)trimmed_.size();
+    }
+    if (!group.empty()) {
+        Log(L"[cryo] woke %zu processes: settings=%.2f ms dma=%.1f MB/s",
+            group.size(), restoreSettingsMs, bestMbps);
+    }
+    return (int)group.size();
 }
 
 int CryoSwap::WakeGroup(const std::wstring& name, double& ms)
 {
     if (!pool_) return 0;
-    Timer timer;
-    timer.Begin();
 
-    std::vector<TrimmedProcess> group;
+    std::vector<DWORD> pids;
     {
         std::lock_guard<std::mutex> lock(trimmedMutex_);
-        for (auto it = trimmed_.begin(); it != trimmed_.end();) {
-            if (!name.empty() && it->name != name) {
-                ++it;
-                continue;
-            }
-            group.push_back(*it);
-            it = trimmed_.erase(it);
+        for (const TrimmedProcess& entry : trimmed_) {
+            if (name.empty() || entry.name == name) pids.push_back(entry.pid);
         }
     }
-
-    int woken = 0;
-    double bestMbps = 0.0;
-    for (const TrimmedProcess& entry : group) {
-        double mbps = 0.0;
-        if (WakeTrimmedEntry(entry, mbps)) {
-            ++woken;
-            if (mbps > bestMbps) bestMbps = mbps;
-        }
+    if (pids.empty()) {
+        ms = 0.0;
+        return 0;
     }
-
-    ms = timer.Ms();
-    {
-        std::lock_guard<std::mutex> lock(statsMutex_);
-        stats_.lastWakeMs = ms;
-        if (bestMbps > 0.0) stats_.lastEgressMBps = bestMbps;
-        stats_.trimmed = (int)trimmed_.size();
-    }
-    if (woken > 0) {
-        Log(L"[cryo] woke group '%ls': %d processes in %.2f ms (dma=%.1f MB/s)",
-            name.empty() ? L"*" : name.c_str(), woken, ms, bestMbps);
-    }
-    return woken;
+    return WakePids(pids, ms);
 }
 
 int CryoSwap::WakeAllTrimmed()
 {
+    std::vector<DWORD> pids;
+    {
+        std::lock_guard<std::mutex> lock(trimmedMutex_);
+        for (const TrimmedProcess& entry : trimmed_) pids.push_back(entry.pid);
+    }
     double ms = 0.0;
-    return WakeGroup(L"", ms);
+    return WakePids(pids, ms);
+}
+
+LiveMetrics CryoSwap::LastLiveMetrics() const
+{
+    std::lock_guard<std::mutex> lock(statsMutex_);
+    return liveMetrics_;
 }
 
 bool CryoSwap::IsTrimmed(DWORD pid) const
@@ -1316,10 +1467,11 @@ void CryoSwap::MonitorLoop()
             const ULONGLONG now = GetTickCount64();
             if (now - lastCycle >= 15000) {
                 lastCycle = now;
-                if (AvailablePhysicalMb() < 1024) RunCycle();
+                if (AvailablePhysicalMb() < 1024)
+                    RunCycle(LiveTrimMode::SafeAutopilot);
             }
         }
 
-        Sleep(80);
+        Sleep(20);
     }
 }

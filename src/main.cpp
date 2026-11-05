@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <tlhelp32.h>
+
 #include "engine/CommitGuard.h"
 #include "engine/CryoSwap.h"
 #include "engine/Hash64.h"
@@ -357,6 +359,8 @@ std::wstring ResolveDataDir()
     return LocalAppData();
 }
 
+int RunReleaseAll(); // defined below, used by the guard fail-safe
+
 uint64_t ProcessCreationTime(HANDLE process)
 {
     FILETIME create{}, exit{}, kernel{}, user{};
@@ -494,6 +498,10 @@ int RunRecoveryGuard(DWORD parentPid)
     const RecoveryOutcome outcome = RecoverFromJournal(bridge);
     bridge.Shutdown();
 
+    // Fail-safe for the LIVE mode: whatever the engine did to user processes
+    // (memory priority, quota, EcoQoS) must not survive its death.
+    RunReleaseAll();
+
     // 2 tells the caller that at least one record was refused (PID reuse).
     return outcome.pidReuseSkipped > 0 ? 2 : 0;
 }
@@ -579,7 +587,8 @@ int RunReleaseAll()
     for (size_t i = 0; i < count; ++i) {
         const DWORD pid = pids[i];
         if (!pid || pid == 4 || pid == self) continue;
-        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION,
+        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
+                                         PROCESS_SET_INFORMATION,
                                      FALSE, pid);
         if (!process) continue;
         if (SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0)) ++released;
@@ -588,9 +597,33 @@ int RunReleaseAll()
         state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
         state.StateMask = 0;
         SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
+        struct PriorityInfo { ULONG MemoryPriority; } priority{ 5 };
+        SetProcessInformation(process, ProcessMemoryPriority, &priority,
+                              sizeof(priority));
         CloseHandle(process);
     }
     return released > 0 ? 0 : 1;
+}
+
+// Live-mode killable worker for the crash-recovery test.
+int RunTrimVictim(DWORD victimPid, const std::wstring& dataDir)
+{
+    StorageBridge bridge;
+    if (!bridge.Init(dataDir, 6ull * 64ull * kMb)) return 2;
+    if (!bridge.InitCryoMirror(dataDir, kMirrorCapacity)) return 2;
+    if (!bridge.InitJournal(dataDir)) return 2;
+
+    VramPool pool;
+    if (!pool.Init(&bridge, 0, 1024, dataDir + L"\\engine.log")) return 3;
+    CryoSwap cryo;
+    cryo.Init(&pool, &bridge);
+
+    SpawnRecoveryGuard();
+
+    std::vector<DWORD> pids{ victimPid };
+    cryo.TrimPids(pids, LiveTrimMode::AggressiveReclaim);
+    Sleep(INFINITE);
+    return 0;
 }
 
 // ------------------------------------------------------- live combat --------
@@ -687,218 +720,571 @@ double SumWorkingSetMb(const std::vector<DWORD>& pids)
     return total;
 }
 
+// ============================ STAGE 12.1 LIVE COMBAT ========================
+
+FILE* g_trace = nullptr;
+
+void Trace(const wchar_t* format, ...)
+{
+    if (!g_trace) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    fwprintf(g_trace, L"[%02u:%02u:%02u.%03u] ", now.wHour, now.wMinute, now.wSecond,
+             now.wMilliseconds);
+    va_list args;
+    va_start(args, format);
+    vfwprintf(g_trace, format, args);
+    va_end(args);
+    fwprintf(g_trace, L"\n");
+    fflush(g_trace);
+}
+
+struct BenchResult {
+    double tickP50 = 0, tickP95 = 0, tickP99 = 0, tickMax = 0;
+    double pingP50 = 0, pingP95 = 0, pingP99 = 0, pingMax = 0;
+    int pings = 0;
+    uint64_t faultsBefore = 0, faultsAfter = 0;
+    uint64_t availBefore = 0, availAfter = 0;
+};
+
+double Percentile(std::vector<double> values, double fraction)
+{
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    size_t index = (size_t)(fraction * (double)(values.size() - 1));
+    if (index >= values.size()) index = values.size() - 1;
+    return values[index];
+}
+
+// Foreground responsiveness probe: 128 MB of RAM work per tick plus a WM_NULL
+// ping to the background window. This is the "user is working" reference.
+void RunResponsiveness(HWND window, int durationMs, BenchResult& out)
+{
+    std::vector<double> ticks;
+    std::vector<double> pings;
+    std::vector<uint8_t> buffer((size_t)(128ull * 1024 * 1024), 0xA5);
+
+    const DWORD previousPriority = GetThreadPriority(GetCurrentThread());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    struct FaultProbe { DWORD pid; uint64_t faults; } ;
+    std::vector<FaultProbe> probe;
+
+    out.availBefore = AvailablePhysicalMb();
+    Timer total;
+    total.Begin();
+    volatile uint64_t sink = 0;
+    while (total.Ms() < (double)durationMs) {
+        Timer tick;
+        tick.Begin();
+        uint64_t sum = 0;
+        for (size_t i = 0; i < buffer.size(); i += 4096) {
+            buffer[i] = (uint8_t)(buffer[i] + 1);
+            sum += buffer[i];
+        }
+        sink += sum;
+        ticks.push_back(tick.Ms());
+
+        if (window && IsWindow(window)) {
+            Timer ping;
+            ping.Begin();
+            DWORD_PTR reply = 0;
+            SendMessageTimeoutW(window, WM_NULL, 0, 0,
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &reply);
+            pings.push_back(ping.Ms());
+        }
+        Sleep(1);
+    }
+    out.availAfter = AvailablePhysicalMb();
+
+    SetThreadPriority(GetCurrentThread(), previousPriority);
+
+    out.tickP50 = Percentile(ticks, 0.50);
+    out.tickP95 = Percentile(ticks, 0.95);
+    out.tickP99 = Percentile(ticks, 0.99);
+    out.tickMax = ticks.empty() ? 0.0 : *std::max_element(ticks.begin(), ticks.end());
+    out.pingP50 = Percentile(pings, 0.50);
+    out.pingP95 = Percentile(pings, 0.95);
+    out.pingP99 = Percentile(pings, 0.99);
+    out.pingMax = pings.empty() ? 0.0 : *std::max_element(pings.begin(), pings.end());
+    out.pings = (int)pings.size();
+    (void)probe;
+}
+
+std::wstring ChromePath()
+{
+    const wchar_t* candidates[] = {
+        L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        L"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    };
+    for (const wchar_t* path : candidates) {
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return path;
+    }
+    wchar_t local[MAX_PATH]{};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
+        const std::wstring path =
+            std::wstring(local) + L"\\Google\\Chrome\\Application\\chrome.exe";
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return path;
+    }
+    return std::wstring();
+}
+
+std::vector<DWORD> DescendantsOf(DWORD root)
+{
+    std::vector<std::pair<DWORD, DWORD>> edges;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return { root };
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            edges.push_back({ entry.th32ProcessID, entry.th32ParentProcessID });
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+
+    std::vector<DWORD> result{ root };
+    bool added = true;
+    while (added) {
+        added = false;
+        for (const auto& edge : edges) {
+            if (std::find(result.begin(), result.end(), edge.first) != result.end()) continue;
+            if (std::find(result.begin(), result.end(), edge.second) != result.end()) {
+                result.push_back(edge.first);
+                added = true;
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<WindowRef> WindowsOfPids(const std::vector<DWORD>& pids)
+{
+    std::vector<WindowRef> all;
+    EnumWindows(CollectWindow, reinterpret_cast<LPARAM>(&all));
+    std::vector<WindowRef> filtered;
+    for (const WindowRef& window : all) {
+        if (std::find(pids.begin(), pids.end(), window.pid) != pids.end()) {
+            filtered.push_back(window);
+        }
+    }
+    return filtered;
+}
+
+bool ReadPriority(HANDLE process, uint32_t& value)
+{
+    struct Info { ULONG MemoryPriority; } info{};
+    if (!GetProcessInformation(process, ProcessMemoryPriority, &info, sizeof(info))) {
+        return false;
+    }
+    value = info.MemoryPriority;
+    return true;
+}
+
+uint32_t PriorityOf(DWORD pid)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return 0;
+    uint32_t value = 0;
+    ReadPriority(process, value);
+    CloseHandle(process);
+    return value;
+}
+
+std::wstring WindowTitle(HWND window)
+{
+    wchar_t title[512]{};
+    GetWindowTextW(window, title, 512);
+    return title;
+}
+
+bool WriteWorkload(const std::wstring& path)
+{
+    FILE* file = _wfsopen(path.c_str(), L"w", _SH_DENYNO);
+    if (!file) return false;
+    const char* html =
+        "<!doctype html><meta charset=\"utf-8\">\n"
+        "<title>CHZM_LIVE_OK|TICKS:0|MAX_JITTER_MS:0.00|HASH:INIT|MB:64</title>\n"
+        "<body style=\"background:#101014;color:#9ad;font:14px monospace\">\n"
+        "<pre id=\"p\">warming</pre>\n"
+        "<script>\n"
+        "const MB=64, buf=new Uint8Array(MB*1024*1024);\n"
+        "let expectedSum=0;\n"
+        "for(let i=0;i<buf.length;i+=4096){buf[i]=(i/4096)&0xff;expectedSum+=buf[i];}\n"
+        "let ticks=0,maxJitter=0,expected=performance.now()+40,flips=0;\n"
+        "setInterval(()=>{\n"
+        "  const now=performance.now();const jitter=Math.abs(now-expected);\n"
+        "  if(jitter>maxJitter)maxJitter=jitter;expected=now+40;\n"
+        "  let sum=0;for(let i=0;i<buf.length;i+=4096)sum+=buf[i];\n"
+        "  const ok=(sum===expectedSum);\n"
+        "  const idx=(ticks*4096)%buf.length;const oldV=buf[idx];buf[idx]=oldV^1;\n"
+        "  expectedSum+=buf[idx]-oldV;flips++;ticks++;\n"
+        "  document.title='CHZM_LIVE_OK|TICKS:'+ticks+'|MAX_JITTER_MS:'+\n"
+        "    maxJitter.toFixed(2)+'|HASH:'+(ok?'MATCH':'MISMATCH')+'|MB:'+MB;\n"
+        "  document.getElementById('p').textContent='ticks '+ticks+' sum '+sum+\n"
+        "    ' expected '+expectedSum+' jitter '+maxJitter.toFixed(2);\n"
+        "},40);\n"
+        "</script></body>\n";
+    fputs(html, file);
+    fclose(file);
+    return true;
+}
+
+void RemoveTree(const std::wstring& path)
+{
+    std::wstring command = L"cmd /c rmdir /s /q \"" + path + L"\"";
+    _wsystem(command.c_str());
+}
+
 int RunLiveCombat(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
                   const std::wstring& dataDir)
 {
     const std::wstring docs = ExecutableDir() + L"\\..\\docs";
-    const std::wstring path =
+    const std::wstring reportPath =
         GetFileAttributesW(docs.c_str()) != INVALID_FILE_ATTRIBUTES
-            ? docs + L"\\STAGE12_LIVE_COMBAT_REPORT.txt"
-            : dataDir + L"\\STAGE12_LIVE_COMBAT_REPORT.txt";
-    FILE* out = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
+            ? docs + L"\\STAGE12_1_CHROME_VALIDATION_REPORT.txt"
+            : dataDir + L"\\STAGE12_1_CHROME_VALIDATION_REPORT.txt";
+
+    g_trace = _wfsopen((dataDir + L"\\stage12_1_full_trace.log").c_str(),
+                       L"w, ccs=UTF-8", _SH_DENYNO);
+    FILE* out = _wfsopen(reportPath.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
     if (!out) return 6;
+
+    auto Both = [&](const wchar_t* format, ...) {
+        va_list args;
+        va_start(args, format);
+        wchar_t buffer[1024];
+        vswprintf_s(buffer, 1024, format, args);
+        va_end(args);
+        Report(out, L"%ls", buffer);
+        Trace(L"%ls", buffer);
+    };
 
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    Report(out, L"CHZM//SILICONFUSE  STAGE 12  LIVE COMBAT REPORT");
-    Report(out, L"generated=%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth,
-           now.wDay, now.wHour, now.wMinute, now.wSecond);
-    Report(out, L"mode=live safe trim (no suspend, no MEM_RESET)");
-    Report(out, L"");
+    Both(L"CHZM//SILICONFUSE  STAGE 12.1  CHROME VALIDATION REPORT");
+    Both(L"generated=%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth, now.wDay,
+         now.wHour, now.wMinute, now.wSecond);
+    Both(L"");
 
-    Report(out, L"[TEST 1: BUILD]");
-    wchar_t exePath[MAX_PATH * 2]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
-    WIN32_FILE_ATTRIBUTE_DATA fileInfo{};
-    GetFileAttributesExW(exePath, GetFileExInfoStandard, &fileInfo);
-    Report(out, L"  exe_size_bytes = %llu",
-           (unsigned long long)(((uint64_t)fileInfo.nFileSizeHigh << 32) |
-                                fileInfo.nFileSizeLow));
-    Report(out, L"  hard_mode      = available only via --torture-test");
-    Report(out, L"  live_mode      = quota + EmptyWorkingSet + EcoQoS, threads untouched");
-    Report(out, L"");
+    // ------------------------------------------------------- PHASE 0 --------
+    Both(L"[PHASE 0: ISOLATED CHROME STAND]");
+    const std::wstring profile = LocalAppData() + L"\\..\\Temp\\CHZM_Stage12_1_Profile";
+    CreateDirectoryW(profile.c_str(), nullptr);
+    const std::wstring workload = profile + L"\\workload.html";
+    if (!WriteWorkload(workload)) {
+        Both(L"  workload_write = FAILED");
+        fclose(out);
+        return 2;
+    }
+    Both(L"  profile_dir    = %ls", profile.c_str());
 
-    // Three warm processes of our own: if anything suspended them, they would
-    // not answer the verify event after the trim.
-    std::vector<VictimHandle> warm;
-    const uint64_t warmSizes[3] = { 180, 220, 260 };
-    for (int i = 0; i < 3; ++i) {
-        VictimHandle handle;
-        if (StartVictim(warmSizes[i], (uint32_t)(60 + i), handle)) {
-            warm.push_back(handle);
+    const std::wstring chrome = ChromePath();
+    Both(L"  chrome_path    = %ls", chrome.empty() ? L"NOT FOUND" : chrome.c_str());
+    if (chrome.empty()) {
+        Both(L"  RESULT: chrome not installed");
+        fclose(out);
+        return 3;
+    }
+
+    const std::wstring url = L"file:///" + workload;
+    std::wstring command = L"\"" + chrome + L"\" --user-data-dir=\"" + profile +
+                           L"\" --no-first-run --no-default-browser-check "
+                           L"--disable-background-timer-throttling --new-window \"" +
+                           url + L"\" \"" + url + L"\" \"" + url + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION chromeProc{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &chromeProc)) {
+        Both(L"  chrome_spawn   = FAILED (%lu)", (unsigned long)GetLastError());
+        fclose(out);
+        return 4;
+    }
+    Both(L"  chrome_root_pid= %lu", (unsigned long)chromeProc.dwProcessId);
+    Trace(L"waiting 3 s for chrome warm-up");
+    Sleep(3000);
+
+    std::vector<DWORD> group = DescendantsOf(chromeProc.dwProcessId);
+    Both(L"  group_size     = %zu", group.size());
+    Both(L"");
+    Both(L"  PID     Parent  WS_MB   PrivWS_MB  Faults     Priority");
+    for (DWORD pid : group) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) continue;
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        uint32_t priority = 0;
+        const bool have = GetProcessMemoryInfo(
+            process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+            sizeof(counters)) != FALSE;
+        ReadPriority(process, priority);
+        const DWORD parent = 0;
+        CloseHandle(process);
+        if (have) {
+            Both(L"  %-7lu %-7lu %7.1f %10.1f %10llu %8u", (unsigned long)pid,
+                 (unsigned long)parent,
+                 (double)counters.WorkingSetSize / (1024.0 * 1024.0),
+                 (double)counters.PrivateUsage / (1024.0 * 1024.0),
+                 (unsigned long long)counters.PageFaultCount, priority);
         }
     }
-    // -------------------------------------------------- BEFORE ------------
-    const std::vector<DWORD> chromeBefore = PidsByName(L"chrome.exe");
-    const double chromeWsBefore = SumWorkingSetMb(chromeBefore);
-    const std::vector<WindowRef> windows = VisibleWindowsOf(chromeBefore);
-    const uint64_t availBefore = AvailablePhysicalMb();
+    Both(L"");
 
-    Report(out, L"[TEST 2: SNAPSHOT BEFORE]");
-    Report(out, L"  chrome_pids_before   = %d", (int)chromeBefore.size());
-    Report(out, L"  chrome_ws_before_mb  = %.1f", chromeWsBefore);
-    int chromeAboveThreshold = 0;
-    for (DWORD pid : chromeBefore) {
-        if (ReadProcessNumbers(pid).wsMb >= 50.0) ++chromeAboveThreshold;
+    std::vector<WindowRef> chromeWindows = WindowsOfPids(group);
+    HWND chromeWindow = nullptr;
+    for (const WindowRef& window : chromeWindows) {
+        if (!chromeWindow) chromeWindow = window.hwnd;
+        Both(L"  window hwnd=0x%p pid=%lu title=%ls", (void*)window.hwnd,
+             (unsigned long)window.pid, window.title.c_str());
     }
-    Report(out, L"  chrome_visible_windows = %d", (int)windows.size());
-    Report(out, L"  chrome_above_50mb    = %d (live trim threshold)", chromeAboveThreshold);
-    for (const WindowRef& window : windows) {
-        Report(out, L"    hwnd=0x%p pid=%lu title=%ls", (void*)window.hwnd,
-               (unsigned long)window.pid, window.title.c_str());
+    if (!chromeWindow) {
+        Both(L"  RESULT: no visible chrome window");
+        TerminateProcess(chromeProc.hProcess, 0);
+        fclose(out);
+        return 5;
     }
-    const DWORD foregroundNow = []() {
-        const HWND window = GetForegroundWindow();
-        DWORD pid = 0;
-        if (window) GetWindowThreadProcessId(window, &pid);
-        return pid;
-    }();
-    const bool chromeFocused =
-        std::find(chromeBefore.begin(), chromeBefore.end(), foregroundNow) != chromeBefore.end();
-    Report(out, L"  foreground_pid       = %lu", (unsigned long)foregroundNow);
-    Report(out, L"  chrome_foreground    = %d (focused apps are skipped by design)",
-           chromeFocused ? 1 : 0);
-    Report(out, L"  avail_ram_before_mb  = %llu", (unsigned long long)availBefore);
-    Report(out, L"");
 
-    // -------------------------------------------------- TRIM --------------
+    SetForegroundWindow(chromeWindow);
+    Sleep(200);
+    ShowWindow(chromeWindow, SW_MINIMIZE);
+    Sleep(700);
+    DWORD foreground = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    const bool chromeForeground =
+        std::find(group.begin(), group.end(), foreground) != group.end();
+    Both(L"  chrome_foreground = %d (must be 0)", chromeForeground ? 1 : 0);
+    Both(L"");
 
-    Timer cycleTimer;
-    cycleTimer.Begin();
-    const int trimmed = cryo.RunCycle();
-    const double cycleMs = cycleTimer.Ms();
-    const CryoStats stats = cryo.GetStats();
-    const uint64_t availAfterTrim = AvailablePhysicalMb();
+    // ------------------------------------------------------- PHASE 1 --------
+    Both(L"[PHASE 1: BASELINE - WINDOWS STOCK]");
+    BenchResult stock;
+    RunResponsiveness(chromeWindow, 2000, stock);
+    Both(L"  tick  p50=%.2f p95=%.2f p99=%.2f max=%.2f ms", stock.tickP50,
+         stock.tickP95, stock.tickP99, stock.tickMax);
+    Both(L"  ping  p50=%.2f p95=%.2f p99=%.2f max=%.2f ms (%d pings)", stock.pingP50,
+         stock.pingP95, stock.pingP99, stock.pingMax, stock.pings);
+    Both(L"  avail_ram %llu -> %llu MB", (unsigned long long)stock.availBefore,
+         (unsigned long long)stock.availAfter);
+    Both(L"");
 
-    Report(out, L"[TEST 3: LIVE SAFE CRYOTRIM]");
-    Report(out, L"  trimmed_count    = %d", trimmed);
-    Report(out, L"  hot_cache_mb     = %llu (streamed into GDDR6)",
-           (unsigned long long)(stats.hotBytes / kMb));
-    Report(out, L"  saved_ddr4_mb    = %llu", (unsigned long long)(stats.savedBytes / kMb));
-    Report(out, L"  cycle_ms         = %.2f", cycleMs);
-    Report(out, L"  stored_trimmed   = %d", stats.trimmed);
-    Report(out, L"  processes_frozen = %d (must stay 0 in live mode)", stats.frozen);
-    Report(out, L"  trim_ingress_mbps= %.1f", cycleMs > 0.0 ? (double)stats.hotBytes / (1024.0 * 1024.0) / (cycleMs / 1000.0) : 0.0);
-    Report(out, L"  avail_ram_after_mb = %llu", (unsigned long long)availAfterTrim);
-    Report(out, L"  avail_ram_delta_mb = %lld",
-           (long long)availAfterTrim - (long long)availBefore);
-    pool.LogSensors(L"live-trim");
-    Report(out, L"");
-
-    // --------------------------------------------- SURVIVAL + RESPONSIVENESS
-    Sleep(3000); // Chrome's own watchdog window
-
-    const std::vector<DWORD> chromeAfter = PidsByName(L"chrome.exe");
-    const double chromeWsAfter = SumWorkingSetMb(chromeAfter);
-
-    int hung = 0;
-    int answered = 0;
-    double worstMs = 0.0;
-    double totalMs = 0.0;
-    for (const WindowRef& window : windows) {
-        if (!IsWindow(window.hwnd)) continue;
-        const PingResult ping = PingWindow(window.hwnd);
-        if (ping.hung) ++hung;
-        if (ping.answered) ++answered;
-        totalMs += ping.ms;
-        if (ping.ms > worstMs) worstMs = ping.ms;
+    // ------------------------------------------------------- PHASE 2 --------
+    Both(L"[PHASE 2: LIVE_SAFE_AUTOPILOT]");
+    const int safeCount = cryo.TrimPids(group, LiveTrimMode::SafeAutopilot);
+    for (DWORD pid : group) {
+        const uint32_t priority = PriorityOf(pid);
+        Trace(L"autopilot pid=%lu priority=%u", (unsigned long)pid, priority);
     }
-    const double averageMs = answered > 0 ? totalMs / answered : 0.0;
+    const LiveMetrics safeMetrics = cryo.LastLiveMetrics();
+    Both(L"  processes      = %d", safeCount);
+    Both(L"  priority map   = 5 -> 2 (LOW), EcoQoS ON");
+    Both(L"  ws_sum_mb      = %llu", (unsigned long long)(safeMetrics.trimmedWsSum / kMb));
+    Both(L"  priv_sum_mb    = %llu",
+         (unsigned long long)(safeMetrics.trimmedPrivateWsSum / kMb));
+    Both(L"  sys_avail_delta= %lld MB", (long long)safeMetrics.systemAvailableDelta);
 
-    Report(out, L"[TEST 4: SURVIVAL + WINDOW RESPONSIVENESS]");
-    Report(out, L"  chrome_pids_after    = %d", (int)chromeAfter.size());
-    Report(out, L"  crashed_tabs         = %d", (int)chromeBefore.size() - (int)chromeAfter.size());
-    Report(out, L"  chrome_ws_after_mb   = %.1f", chromeWsAfter);
-    Report(out, L"  windows_probed       = %d", (int)windows.size());
-    Report(out, L"  windows_answered     = %d", answered);
-    Report(out, L"  windows_hung         = %d (must be 0)", hung);
-    Report(out, L"  ping_avg_ms          = %.2f (must be < 10.0)", averageMs);
-    Report(out, L"  ping_worst_ms        = %.2f", worstMs);
-    Report(out, L"  verdict              = %ls",
-           (hung == 0 && averageMs < 10.0 &&
-            chromeAfter.size() >= chromeBefore.size())
-               ? L"NO HANG, NO CRASH"
-               : L"CHECK REQUIRED");
-    Report(out, L"");
+    BenchResult safe;
+    RunResponsiveness(chromeWindow, 2000, safe);
+    Both(L"  tick  p50=%.2f p95=%.2f p99=%.2f max=%.2f ms", safe.tickP50, safe.tickP95,
+         safe.tickP99, safe.tickMax);
+    Both(L"  ping  p50=%.2f p95=%.2f p99=%.2f max=%.2f ms", safe.pingP50, safe.pingP95,
+         safe.pingP99, safe.pingMax);
 
-    // Threads must never be suspended: the warm processes are trimmed and
-    // still answer their verify event instantly.
-    int warmTrimmed = 0;
-    int warmReacted = 0;
-    double worstReactMs = 0.0;
-    for (VictimHandle& handle : warm) {
-        if (cryo.IsTrimmed(handle.marker.pid)) ++warmTrimmed;
-        Timer react;
-        react.Begin();
-        if (handle.verify) SetEvent(handle.verify);
-        const DWORD wait = WaitForSingleObject(handle.child.hProcess, 2000);
-        const double ms = react.Ms();
-        if (wait == WAIT_OBJECT_0) {
-            ++warmReacted;
-            if (ms > worstReactMs) worstReactMs = ms;
+    double safeRestore = 0.0;
+    cryo.WakePids(group, safeRestore);
+    Both(L"  restore_settings_ms = %.2f", safeRestore);
+    Both(L"");
+
+    // ------------------------------------------------------- PHASE 3 --------
+    Both(L"[PHASE 3: LIVE_AGGRESSIVE_RECLAIM]");
+    std::vector<DWORD> aliveBeforeTrim;
+    for (DWORD pid : group) {
+        HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (probe) {
+            if (WaitForSingleObject(probe, 0) == WAIT_TIMEOUT) aliveBeforeTrim.push_back(pid);
+            CloseHandle(probe);
         }
     }
-    Report(out, L"[TEST 4B: THREAD SAFETY (NO SUSPEND)");
-    Report(out, L"  warm_processes      = %d", (int)warm.size());
-    Report(out, L"  warm_trimmed        = %d", warmTrimmed);
-    Report(out, L"  warm_reacted        = %d (must equal warm_processes)", warmReacted);
-    Report(out, L"  worst_react_ms      = %.2f (exit + self-verify, threads alive)",
-           worstReactMs);
-    for (VictimHandle& handle : warm) StopVictim(handle);
-    warm.clear();
-    Report(out, L"");
+    const int aggressiveCount = cryo.TrimPids(group, LiveTrimMode::AggressiveReclaim);
+    const LiveMetrics aggressive = cryo.LastLiveMetrics();
+    Both(L"  processes      = %d", aggressiveCount);
+    Both(L"  trimmed_ws_sum_mb      = %llu",
+         (unsigned long long)(aggressive.trimmedWsSum / kMb));
+    Both(L"  trimmed_private_ws_sum_mb = %llu",
+         (unsigned long long)(aggressive.trimmedPrivateWsSum / kMb));
+    Both(L"  system_available_delta_mb = %lld",
+         (long long)aggressive.systemAvailableDelta);
+    Both(L"  commit_delta_mb           = %lld", (long long)(aggressive.commitDelta / kMb));
+    Both(L"  gddr6_snapshot_copy_mb    = %llu",
+         (unsigned long long)(aggressive.gddr6SnapshotBytes / kMb));
+    Both(L"  hard_fault_delta          = %llu",
+         (unsigned long long)aggressive.hardFaultDelta);
+    Both(L"  elapsed_ms                = %llu",
+         (unsigned long long)aggressive.elapsedMs);
 
-    // ------------------------------------------- VRAM PRESSURE (6 GB) -----
-    const PoolStats before = pool.GetStats();
-    pool.RequestResize(6144);
-    Sleep(500);
-    const PoolStats pressed = pool.GetStats();
-    pool.RequestResize(4096);
-    Sleep(400);
-    const PoolStats relieved = pool.GetStats();
+    Sleep(1500);
+    std::vector<DWORD> aliveAfterTrim;
+    for (DWORD pid : aliveBeforeTrim) {
+        HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (process) {
+            if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) aliveAfterTrim.push_back(pid);
+            CloseHandle(process);
+        }
+    }
+    const int crashed = (int)aliveBeforeTrim.size() - (int)aliveAfterTrim.size();
+    Both(L"  alive_after    = %zu / %zu (crashed=%d)", aliveAfterTrim.size(),
+         aliveBeforeTrim.size(), crashed);
 
-    Report(out, L"[TEST 5: VRAM PRESSURE (GRANULAR YIELD)]");
-    Report(out, L"  slices_before  = %d (%llu MB)", before.sliceCount,
-           (unsigned long long)(before.poolBytes / kMb));
-    Report(out, L"  slices_6gb     = %d (%llu MB)", pressed.sliceCount,
-           (unsigned long long)(pressed.poolBytes / kMb));
-    Report(out, L"  slices_after   = %d (%llu MB)", relieved.sliceCount,
-           (unsigned long long)(relieved.poolBytes / kMb));
-    Report(out, L"  commit_free_mb = %llu", (unsigned long long)FreeCommitMb());
-    Report(out, L"");
+    BenchResult aggressiveBench;
+    RunResponsiveness(chromeWindow, 2000, aggressiveBench);
+    Both(L"  tick  p50=%.2f p95=%.2f p99=%.2f max=%.2f ms", aggressiveBench.tickP50,
+         aggressiveBench.tickP95, aggressiveBench.tickP99, aggressiveBench.tickMax);
+    Both(L"  ping  p50=%.2f p95=%.2f p99=%.2f max=%.2f ms", aggressiveBench.pingP50,
+         aggressiveBench.pingP95, aggressiveBench.pingP99, aggressiveBench.pingMax);
+    Both(L"");
 
-    // ------------------------------------------------ WAKE (ALT+TAB) ------
-    double wakeMs = 0.0;
-    const int woken = cryo.WakeGroup(L"chrome.exe", wakeMs);
-    Sleep(400);
-    const std::vector<DWORD> chromeWake = PidsByName(L"chrome.exe");
-    const double chromeWsWake = SumWorkingSetMb(chromeWake);
+    // ------------------------------------------------------- PHASE 4 --------
+    Both(L"[PHASE 4: WAKE (ALT+TAB) + JS INTEGRITY]");
+    SetForegroundWindow(chromeWindow);
+    ShowWindow(chromeWindow, SW_RESTORE);
+    Timer wakeTimer;
+    wakeTimer.Begin();
+    double wakeRestore = 0.0;
+    const int woken = cryo.WakePids(aliveAfterTrim, wakeRestore);
+    const double wakeLatency = wakeTimer.Ms();
+    Both(L"  woken_processes     = %d", woken);
+    Both(L"  wake_latency_ms     = %.2f", wakeLatency);
+    Both(L"  restore_settings_ms = %.2f", wakeRestore);
 
-    Report(out, L"[TEST 6: GROUP WAKE (SIMULATED ALT+TAB)");
-    Report(out, L"  woken_processes  = %d (all chrome.exe)", woken);
-    Report(out, L"  wake_ms          = %.2f", wakeMs);
-    Report(out, L"  chrome_ws_wake_mb= %.1f", chromeWsWake);
-    Report(out, L"  remaining_trimmed= %d (other applications)", cryo.GetStats().trimmed);
-    Report(out, L"");
+    std::vector<double> quickPings;
+    for (int i = 0; i < 100; ++i) {
+        Timer ping;
+        ping.Begin();
+        DWORD_PTR reply = 0;
+        SendMessageTimeoutW(chromeWindow, WM_NULL, 0, 0,
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &reply);
+        quickPings.push_back(ping.Ms());
+    }
+    Both(L"  ping100 p50=%.3f p95=%.3f p99=%.3f max=%.3f ms",
+         Percentile(quickPings, 0.50), Percentile(quickPings, 0.95),
+         Percentile(quickPings, 0.99),
+         quickPings.empty() ? 0.0 : *std::max_element(quickPings.begin(), quickPings.end()));
 
-    // Release every remaining application so the machine is left clean.
-    double flushMs = 0.0;
-    const int flushed = cryo.WakeAllTrimmed();
-    RunReleaseAll(); // also clears quotas left by earlier runs
-    Report(out, L"[TEST 7: FINAL CLEANUP (RESET)");
-    Report(out, L"  flushed_processes = %d", flushed);
-    Report(out, L"  flush_ms          = %.2f", flushMs);
-    Report(out, L"  trimmed_left      = %d (must be 0)", cryo.GetStats().trimmed);
-    Report(out, L"");
+    Sleep(600);
+    const std::wstring title = WindowTitle(chromeWindow);
+    Both(L"  window_title        = %ls", title.c_str());
+    const bool jsOk = title.find(L"HASH:MATCH") != std::wstring::npos;
+    Both(L"  js_hash_verification= %ls", jsOk ? L"MATCH" : L"MISMATCH");
 
-    Report(out, L"[RESULT]");
-    const bool pass = (hung == 0) && (averageMs < 10.0) &&
-                      (chromeAfter.size() >= chromeBefore.size()) &&
-                      (cryo.GetStats().trimmed == 0);
-    Report(out, L"  status = %ls", pass ? L"PASS" : L"FAIL");
-    Report(out, L"  note   = live mode never suspends threads and never issues MEM_RESET");
+    uint32_t worstPriority = 0;
+    for (DWORD pid : aliveAfterTrim) {
+        const uint32_t priority = PriorityOf(pid);
+        if (priority != 5) worstPriority = priority;
+    }
+    Both(L"  priorities_restored = %ls (worst=%u)",
+         worstPriority == 0 ? L"YES" : L"NO", worstPriority);
+    Both(L"");
+
+    // ------------------------------------------------------- PHASE 5 --------
+    Both(L"[PHASE 5: LIVE CRASH RECOVERY]");
+    VictimHandle victim;
+    bool liveRecovery = false;
+    uint32_t victimPriorityAfter = 0;
+    if (StartVictim(64, 71, victim)) {
+        const std::wstring sandbox = dataDir + L"\\stage121victim";
+        CreateDirectoryW(sandbox.c_str(), nullptr);
+        DeleteFileW((sandbox + L"\\cryo_mirror.bin").c_str());
+        DeleteFileW((sandbox + L"\\cryo_journal.bin").c_str());
+        SetEnvironmentVariableW(L"CHZM_DATA_DIR", sandbox.c_str());
+
+        std::wstring trimCommand = L"\"" + ExecutablePath() + L"\" --trim-victim " +
+                                   std::to_wstring(victim.marker.pid);
+        STARTUPINFOW trimStartup{};
+        trimStartup.cb = sizeof(trimStartup);
+        PROCESS_INFORMATION trimmer{};
+        if (CreateProcessW(nullptr, trimCommand.data(), nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &trimStartup, &trimmer)) {
+            uint32_t before = 0;
+            for (int attempt = 0; attempt < 150; ++attempt) {
+                before = PriorityOf(victim.marker.pid);
+                if (before == 1) break;
+                Sleep(100);
+            }
+            TerminateProcess(trimmer.hProcess, 99);
+            CloseHandle(trimmer.hThread);
+            CloseHandle(trimmer.hProcess);
+            Sleep(3000);
+            victimPriorityAfter = PriorityOf(victim.marker.pid);
+            Both(L"  priority after trim = %u (1 = VERY_LOW)", before);
+            Both(L"  priority after kill = %u (5 = NORMAL)", victimPriorityAfter);
+            liveRecovery = (victimPriorityAfter == 5);
+        }
+        if (victim.verify) SetEvent(victim.verify);
+        StopVictim(victim);
+        SetEnvironmentVariableW(L"CHZM_DATA_DIR", nullptr);
+        DeleteFileW((sandbox + L"\\cryo_mirror.bin").c_str());
+        DeleteFileW((sandbox + L"\\cryo_journal.bin").c_str());
+    }
+    Both(L"  LIVE_CRASH_RECOVERY = %ls", liveRecovery ? L"PASS" : L"FAIL");
+    Both(L"");
+
+    // ------------------------------------------------------- CLEANUP --------
+    Both(L"[PHASE 6: CLEANUP]");
+    PostMessageW(chromeWindow, WM_CLOSE, 0, 0);
+    Sleep(1500);
+    TerminateProcess(chromeProc.hProcess, 0);
+    CloseHandle(chromeProc.hThread);
+    CloseHandle(chromeProc.hProcess);
+    for (DWORD pid : group) {
+        HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if (process) {
+            TerminateProcess(process, 0);
+            CloseHandle(process);
+        }
+    }
+    RunReleaseAll();
+    RemoveTree(profile);
+    Both(L"  chrome_closed = 1");
+    Both(L"  profile_removed = 1");
+    Both(L"");
+
+    // ------------------------------------------------------- SUMMARY --------
+    const bool pass = (!chromeForeground) &&
+                      ((aggressive.trimmedWsSum / kMb) > 150) &&
+                      ((aggressive.trimmedPrivateWsSum / kMb) > 100) &&
+                      (aggressive.systemAvailableDelta > 0) && (crashed == 0) && jsOk &&
+                      liveRecovery && (worstPriority == 0);
+
+    Both(L"[SUMMARY]");
+    Both(L"  metric                          stock      autopilot   aggressive");
+    Both(L"  tick p95 ms                     %8.2f   %8.2f   %8.2f", stock.tickP95,
+         safe.tickP95, aggressiveBench.tickP95);
+    Both(L"  tick p99 ms                     %8.2f   %8.2f   %8.2f", stock.tickP99,
+         safe.tickP99, aggressiveBench.tickP99);
+    Both(L"  tick max ms                     %8.2f   %8.2f   %8.2f", stock.tickMax,
+         safe.tickMax, aggressiveBench.tickMax);
+    Both(L"  ping p95 ms                     %8.2f   %8.2f   %8.2f", stock.pingP95,
+         safe.pingP95, aggressiveBench.pingP95);
+    Both(L"  ping max ms                     %8.2f   %8.2f   %8.2f", stock.pingMax,
+         safe.pingMax, aggressiveBench.pingMax);
+    Both(L"  avail RAM delta MB              %8lld   %8lld   %8lld",
+         (long long)stock.availAfter - (long long)stock.availBefore,
+         (long long)safe.availAfter - (long long)safe.availBefore,
+         (long long)aggressiveBench.availAfter - (long long)aggressiveBench.availBefore);
+    Both(L"");
+    Both(L"RESULT: %ls", pass ? L"PASS" : L"FAIL");
+    Both(L"  trimmed_ws_sum_mb       = %llu",
+         (unsigned long long)(aggressive.trimmedWsSum / kMb));
+    Both(L"  trimmed_private_ws_sum_mb = %llu",
+         (unsigned long long)(aggressive.trimmedPrivateWsSum / kMb));
+    Both(L"  crashed_chrome_processes = %d", crashed);
+    Both(L"  js_hash_verification     = %ls", jsOk ? L"MATCH" : L"MISMATCH");
+    Both(L"  live_crash_recovery      = %ls", liveRecovery ? L"PASS" : L"FAIL");
+
     fclose(out);
-
+    if (g_trace) {
+        fclose(g_trace);
+        g_trace = nullptr;
+    }
     return pass ? 0 : 1;
 }
 
@@ -1513,6 +1899,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
     }
     if (arguments.find(L"--release-all") != std::wstring::npos) {
         return RunReleaseAll();
+    }
+    if (arguments.find(L"--trim-victim") != std::wstring::npos) {
+        return RunTrimVictim(ParsePidAfter(arguments, L"--trim-victim"),
+                             ResolveDataDir());
     }
 
     const std::wstring dataDir = ResolveDataDir();

@@ -299,7 +299,7 @@ void MainWindow::RunCryoNow()
 {
     if (!cryo_) return;
     cryo_->SetEnabled(true);
-    cryo_->RunCycle();
+    cryo_->RunCycle(LiveTrimMode::AggressiveReclaim);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -574,12 +574,18 @@ void MainWindow::DrawScene(HDC dc, int width, int height)
                          cryoResetRect_.left - 8, cryoY + pillH };
 
     CryoStats cryoStats{};
-    if (cryo_) cryoStats = cryo_->GetStats();
+    LiveMetrics live{};
+    if (cryo_) {
+        cryoStats = cryo_->GetStats();
+        live = cryo_->LastLiveMetrics();
+    }
 
-    wchar_t cryoText[160];
-    swprintf_s(cryoText, L"CRYO SAVED: %.1f GB DDR4  |  WAKE %.1f MS  |  TRIMMED %d",
-               (double)cryoStats.savedBytes / (1024.0 * 1024.0 * 1024.0),
-               cryoStats.lastWakeMs, cryoStats.trimmed);
+    wchar_t cryoText[200];
+    swprintf_s(cryoText,
+               L"WS TRIMMED: %llu MB  |  SYS AVAIL: %+lld MB  |  WAKE: %.1f MS  |  %d PROC",
+               (unsigned long long)(live.trimmedWsSum / (1024ull * 1024ull)),
+               (long long)live.systemAvailableDelta, cryoStats.lastWakeMs,
+               cryoStats.trimmed);
     DrawLabel(dc, fontMono_, cryoText,
               RECT{ pad, cryoY, cryoRunRect_.left - 12, cryoY + pillH }, kDim);
 

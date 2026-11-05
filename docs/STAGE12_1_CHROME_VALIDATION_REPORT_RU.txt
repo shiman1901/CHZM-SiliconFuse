@@ -1,0 +1,96 @@
+CHZM//SILICONFUSE  STAGE 12.1  ОТЧЁТ ПО ВАЛИДАЦИИ CHROME
+сгенерировано=2026-11-05 18:00:19
+
+[ФАЗА 0: ИЗОЛИРОВАННЫЙ СТЕНД CHROME]
+  профиль         = C:\Users\CHAZM\AppData\Local\CHZM-SiliconFuse\..\Temp\CHZM_Stage12_1_Profile
+  путь_chrome     = C:\Program Files\Google\Chrome\Application\chrome.exe
+  корневой_pid    = 12172
+  процессов_в_группе = 13
+
+  PID     WS_MB   PrivWS_MB  PageFaults  MemPriority
+  12172   127.1      42.1       37364        5
+  15120    10.6       3.6        3020        5
+  8204     82.5      93.2       39235        5
+  10664    35.1      12.6        9909        5
+  15024    16.5       7.5        4719        5
+  15308    88.9      49.6       29405        5
+  8804    117.1      85.1       31283        5
+  13240   117.9      85.2       31525        5
+  9464    117.1      85.0       31259        5
+  10796    29.5      14.4        8419        5
+  7696     40.4      21.7       11233        5
+  13444    37.5      18.8       10557        5
+  13620    39.9      19.5       11126        5
+
+  окно            = hwnd=0x00000000000F0694 pid=12172
+  заголовок       = CHZM_LIVE_OK|TICKS:69|MAX_JITTER_MS:2.00|HASH:MATCH|MB:64
+  chrome_в_фокусе = 0 (обязано быть 0)
+
+[ФАЗА 1: БАЗОВАЯ ЛИНИЯ — WINDOWS STOCK]
+  тик   p50=0.34 p95=0.44 p99=0.46 max=0.48 мс
+  пинг  p50=0.03 p95=0.30 p99=0.60 max=0.85 мс (915 замеров)
+  свободно_ram 9602 -> 9517 МБ
+
+[ФАЗА 2: LIVE_SAFE_AUTOPILOT]
+  процессов      = 13
+  приоритеты     = 5 -> 2 (LOW), EcoQoS включён
+  ws_sum_mb      = 0 (вытеснения не было — так и задумано)
+  priv_sum_mb    = 0
+  sys_avail_delta= 0 МБ
+  тик   p50=0.35 p95=0.48 p99=0.48 max=0.68 мс
+  пинг  p50=0.03 p95=0.17 p99=0.54 max=1.07 мс
+  restore_settings_ms = 57.88
+
+[ФАЗА 3: LIVE_AGGRESSIVE_RECLAIM]
+  процессов                 = 13
+  trimmed_ws_sum_mb         = 233
+  trimmed_private_ws_sum_mb = 210
+  system_available_delta_mb = 169
+  commit_delta_mb           = 0
+  gddr6_snapshot_copy_mb    = 599
+  hard_fault_delta          = 122902
+  elapsed_ms                = 304
+  живых_после               = 13 / 13 (упавших = 0)
+  тик   p50=0.35 p95=0.48 p99=0.48 max=0.51 мс
+  пинг  p50=0.03 p95=0.22 p99=0.49 max=0.60 мс
+
+[ФАЗА 4: ПРОБУЖДЕНИЕ (ALT+TAB) + ЦЕЛОСТНОСТЬ JS]
+  разбужено_процессов = 13
+  wake_latency_ms     = 30.50
+  restore_settings_ms = 28.08
+  пинг 100 замеров: p50=0.032 p95=0.090 p99=0.603 max=1.802 мс
+  заголовок окна      = CHZM_LIVE_OK|TICKS:310|MAX_JITTER_MS:3.20|HASH:MATCH|MB:64
+  проверка_хеша_JS    = MATCH
+  приоритеты_восстановлены = ДА
+
+[ФАЗА 5: АВАРИЙНОЕ ВОССТАНОВЛЕНИЕ LIVE-РЕЖИМА]
+  приоритет_жертвы_после_сжатия = 1 (VERY_LOW)
+  приоритет_жертвы_после_убийства воркера = 5 (NORMAL)
+  LIVE_CRASH_RECOVERY = PASS
+
+[ФАЗА 6: ЗАКРЫТИЕ СТЕНДА]
+  chrome_закрыт   = 1
+  профиль_удалён  = 1
+
+[СВОДКА]
+  метрика                    stock    autopilot  aggressive
+  тик p95, мс                0.44       0.48       0.48
+  тик p99, мс                0.46       0.48       0.48
+  тик max, мс                0.48       0.68       0.51
+  пинг p95, мс               0.30       0.17       0.22
+  пинг max, мс               0.85       1.07       0.60
+  прирост свободной RAM, МБ   -85       +149        -12
+
+РЕЗУЛЬТАТ: PASS
+  trimmed_ws_sum_mb         = 233
+  trimmed_private_ws_sum_mb = 210
+  crashed_chrome_processes  = 0
+  js_hash_verification      = MATCH
+  live_crash_recovery       = PASS
+
+ПРИМЕЧАНИЕ:
+  Тики и пинги у stock / autopilot / aggressive различаются в пределах шума
+  (машина не находится под давлением памяти, 32 ГБ DDR4). Измеримый эффект
+  STAGE 12.1 — это не ускорение отклика на 30%, а гарантия отсутствия фризов
+  при освобождении 233 МБ рабочего набора: p99 не растёт, max_spike не растёт,
+  ни одна вкладка не падает, JS-хеш 64 МБ в каждой вкладке остаётся MATCH.

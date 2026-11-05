@@ -120,9 +120,33 @@ struct TrimmedProcess {
     uint64_t wsBefore = 0;
     uint64_t wsAfter = 0;
     uint64_t bytes = 0;
+    uint64_t privateBefore = 0;
+    uint64_t privateAfter = 0;
+    uint64_t faultsBefore = 0;
+    uint64_t faultsAfter = 0;
+    int64_t systemDelta = 0;
+    uint32_t priorityBefore = 5;
+    uint32_t priorityApplied = 5;
     ULONGLONG trimmedAt = 0;
     std::vector<CachedChunk> chunks;
     std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+};
+
+enum class LiveTrimMode {
+    SafeAutopilot,      // priority + EcoQoS only, no eviction at all
+    AggressiveReclaim,  // + one-shot soft trim + GDDR6 hot snapshot
+};
+
+struct LiveMetrics {
+    uint64_t trimmedWsSum = 0;
+    uint64_t trimmedPrivateWsSum = 0;
+    int64_t systemAvailableDelta = 0;
+    int64_t commitDelta = 0;
+    uint64_t gddr6SnapshotBytes = 0;
+    uint64_t hardFaultDelta = 0;
+    double restoreSettingsMs = 0.0;
+    uint64_t elapsedMs = 0;
+    int processes = 0;
 };
 
 // CryoSwap moves private pages of background processes into the GDDR6 pool,
@@ -153,13 +177,16 @@ public:
     bool CryoRestore(DWORD pid, bool forceDma, RestoreResult& result);
 
     // Live mode: soft trim, no suspend, no MEM_RESET (GUI default).
-    int RunCycle(DWORD onlyPid = 0);
+    int RunCycle(LiveTrimMode mode = LiveTrimMode::AggressiveReclaim, DWORD onlyPid = 0);
+    int TrimPids(const std::vector<DWORD>& pids, LiveTrimMode mode);
     int Reset();
     // Fail-safe: bring every frozen process back (used on exit and crashes).
     int RestoreAllFrozen();
     // Live mode: lift quotas + DMA warm + prefetch for a whole exe group.
     int WakeGroup(const std::wstring& name, double& ms);
+    int WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs);
     int WakeAllTrimmed();
+    LiveMetrics LastLiveMetrics() const;
     bool IsTrimmed(DWORD pid) const;
     std::wstring TrimmedName(DWORD pid) const;
 
@@ -182,9 +209,10 @@ private:
 
     bool IsCritical(const std::wstring& name) const;
     bool PlaceAndWrite(const uint8_t* data, uint32_t bytes, uint64_t& vramOffset);
-    bool TrimProcess(DWORD pid, const std::wstring& name, HANDLE process,
-                     TrimmedProcess& out);
+    bool TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE process,
+                         LiveTrimMode mode, TrimmedProcess& out);
     int WakeTrimmedEntry(const TrimmedProcess& entry, double& dmaMBps);
+    void RestoreLiveSettings(HANDLE process);
     void JournalSync();
     void JournalSetState(DWORD pid, uint32_t state);
     void PublishCycle(int frozen, int skippedAudio, int skippedCritical, int skippedSmall,
@@ -214,4 +242,5 @@ private:
     std::mutex journalMutex_;
     std::vector<TrimmedProcess> trimmed_;
     mutable std::mutex trimmedMutex_;
+    LiveMetrics liveMetrics_;
 };
