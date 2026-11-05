@@ -1051,6 +1051,22 @@ namespace {
 
 // ProcessCommandLineInformation = 60 (Win 8.1+). Used only to detect the role
 // of Chromium child processes: gpu-process / utility (audio) / crashpad.
+
+// [GAME_IMMUNE] / [AGENT_IMMUNE]: never touch the running game, the agent's own
+// toolchain or the shell, no matter how big their working set gets.
+bool IsGameAgentImmune(const std::wstring& name)
+{
+    static const std::wstring kImmune[] = {
+        L"cyberpunk2077.exe", L"opencode.exe", L"bun.exe", L"node.exe",
+        L"powershell.exe", L"pwsh.exe", L"cmd.exe", L"conhost.exe",
+        L"windowsterminal.exe", L"g++.exe", L"ld.exe", L"git.exe",
+    };
+    for (const std::wstring& blocked : kImmune) {
+        if (name == blocked) return true;
+    }
+    return false;
+}
+
 std::wstring ProcessCommandLine(HANDLE process)
 {
     struct UnicodeStringLocal {
@@ -1090,6 +1106,12 @@ bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE proce
 
     out.pid = pid;
     out.name = name;
+
+    // [GAME_IMMUNE] / [AGENT_IMMUNE]: a running 3D game or the toolchain must
+    // never be trimmed, even from the GUI.
+    if (IsGameAgentImmune(name) || out.wsBefore > 1800ull * kMb) {
+        return false;
+    }
 
     // Step 1: memory priority + EcoQoS. This is what keeps the foreground
     // window fast without ever freezing a live thread.
@@ -1306,9 +1328,14 @@ int CryoSwap::RunCycle(LiveTrimMode mode, DWORD onlyPid)
 
 int CryoSwap::WakeTrimmedEntry(const TrimmedProcess& entry, double& dmaMBps)
 {
-    HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
-                                     PROCESS_VM_READ | PROCESS_SET_INFORMATION,
-                                 FALSE, entry.pid);
+    HANDLE process = entry.handle;
+    bool owned = false;
+    if (!process) {
+        process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
+                                  PROCESS_VM_READ | PROCESS_SET_INFORMATION,
+                              FALSE, entry.pid);
+        owned = true;
+    }
     if (!process) return 0;
 
     RestoreLiveSettings(process);
@@ -1330,7 +1357,9 @@ int CryoSwap::WakeTrimmedEntry(const TrimmedProcess& entry, double& dmaMBps)
                                   entry.ranges.data()),
                               0);
     }
+    // The cached handle was captured at trim time; release it now.
     CloseHandle(process);
+    (void)owned;
     dmaMBps = best;
     return 1;
 }
