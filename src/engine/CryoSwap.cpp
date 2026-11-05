@@ -231,6 +231,23 @@ void ApplyEcoQos(HANDLE process, bool on)
     SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
 }
 
+// Page-aligned staging buffer: the unbuffered mirror requires sector-aligned
+// addresses and the AVX2 stores want 32-byte alignment anyway.
+struct AlignedBuffer {
+    uint8_t* data = nullptr;
+    explicit AlignedBuffer(size_t bytes)
+    {
+        data = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    }
+    ~AlignedBuffer()
+    {
+        if (data) VirtualFree(data, 0, MEM_RELEASE);
+    }
+    AlignedBuffer(const AlignedBuffer&) = delete;
+    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+};
+
 // Checksum of the per-region hashes, so a whole process has one fingerprint.
 uint64_t CombineHashes(const std::vector<uint64_t>& hashes)
 {
@@ -451,7 +468,12 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
 
     // Ingress: RAM -> GDDR6 through the WC-mapped slices (AVX2 streaming),
     // round-robin per chunk across the slices. Every stage is timed.
-    std::vector<uint8_t> bounce((size_t)kChunk);
+    AlignedBuffer bounce((size_t)kChunk);
+    if (!bounce.data) {
+        ResumeProcess(process);
+        CloseHandle(process);
+        return false;
+    }
     uint64_t written = 0;
     std::vector<uint64_t> regionHashes;
     bool ingressOk = true;
@@ -467,7 +489,7 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
             const bool readOk =
                 ReadProcessMemory(process,
                                   reinterpret_cast<const void*>(region.address + offset),
-                                  bounce.data(), (SIZE_T)chunk, &read) != FALSE &&
+                                  bounce.data, (SIZE_T)chunk, &read) != FALSE &&
                 read != 0;
             result.rpmReadMs += stepTimer.Ms();
             if (!readOk) {
@@ -476,12 +498,12 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
             }
 
             stepTimer.Begin();
-            regionHash.Update(bounce.data(), (size_t)read);
+            regionHash.Update(bounce.data, (size_t)read);
             result.hashMs += stepTimer.Ms();
 
             stepTimer.Begin();
             uint64_t vramOffset = 0;
-            const bool placed = PlaceAndWrite(bounce.data(), (uint32_t)read, vramOffset);
+            const bool placed = PlaceAndWrite(bounce.data, (uint32_t)read, vramOffset);
             result.vramWriteMs += stepTimer.Ms();
             if (!placed) {
                 ingressOk = false;
@@ -492,8 +514,12 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
             // destroy the only copy of a frozen process.
             stepTimer.Begin();
             const uint64_t mirrorOffset = mirrorUsed_;
-            const bool mirrored =
-                bridge_->WriteMirror(mirrorOffset, bounce.data(), (size_t)read);
+            bool mirrored =
+                bridge_->WriteMirror(mirrorOffset, bounce.data, (size_t)read);
+            // Chaos hook: fail the mirror half way, before MEM_RESET.
+            if (mirrored && abortInjected_.load() && written >= planned / 2) {
+                mirrored = false;
+            }
             result.mirrorWriteMs += stepTimer.Ms();
             if (!mirrored) {
                 ingressOk = false;
@@ -519,10 +545,18 @@ bool CryoSwap::CryoFreeze(DWORD pid, FreezeResult& result)
     result.origHash = CombineHashes(regionHashes);
     result.bytes = written;
     result.regions = (int)regions.size();
+    result.mirrorDurable = bridge_->MirrorDurable();
 
-    if (!ingressOk || written == 0) {
+    // Hard invariant: nothing may be discarded unless both the VRAM copy and
+    // the mirror copy are durable. Otherwise roll the transaction back and
+    // leave the process exactly as it was.
+    if (!ingressOk || written == 0 || !result.mirrorDurable) {
         ResumeProcess(process);
         CloseHandle(process);
+        Log(L"[cryo] rollback pid=%lu: ingress=%d durable=%d written=%llu MB, "
+            L"process resumed untouched, no MEM_RESET",
+            (unsigned long)pid, ingressOk ? 1 : 0, result.mirrorDurable ? 1 : 0,
+            (unsigned long long)(written / kMb));
         return false;
     }
 
@@ -608,7 +642,11 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
     ApplyEcoQos(process, false);
     result.resumeMs += stepTimer.Ms();
 
-    std::vector<uint8_t> staging((size_t)kChunk);
+    AlignedBuffer staging((size_t)kChunk);
+    if (!staging.data) {
+        CloseHandle(process);
+        return false;
+    }
     std::vector<uint64_t> restoredHashes;
     uint64_t restored = 0;
     bool failSafe = false;
@@ -623,21 +661,21 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
             bool got = false;
             if (fromMirror) {
                 stepTimer.Begin();
-                got = bridge_->ReadMirror(chunk.mirrorOffset, staging.data(), chunk.bytes);
+                got = bridge_->ReadMirror(chunk.mirrorOffset, staging.data, chunk.bytes);
                 result.fallbackMs += stepTimer.Ms();
                 if (got) result.mirrorBytes += chunk.bytes;
             } else {
                 double chunkMbps = 0.0;
                 stepTimer.Begin();
                 got = pool_->ReadCryoDmaInto(chunk.vramOffset, chunk.bytes,
-                                             staging.data(), chunkMbps);
+                                             staging.data, chunkMbps);
                 result.dmaGpuMs += stepTimer.Ms();
                 if (got && chunkMbps > result.dmaMBps) result.dmaMBps = chunkMbps;
             }
             if (!got) return false;
 
             stepTimer.Begin();
-            regionHash.Update(staging.data(), chunk.bytes);
+            regionHash.Update(staging.data, chunk.bytes);
             result.hashVerifyMs += stepTimer.Ms();
 
             SIZE_T wrote = 0;
@@ -645,7 +683,7 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
             const bool writeOk =
                 WriteProcessMemory(process,
                                    reinterpret_cast<void*>(region.address + regionOffset),
-                                   staging.data(), (SIZE_T)chunk.bytes, &wrote) != FALSE &&
+                                   staging.data, (SIZE_T)chunk.bytes, &wrote) != FALSE &&
                 wrote == chunk.bytes;
             result.wpmWriteMs += stepTimer.Ms();
             if (!writeOk) return false;
@@ -681,6 +719,7 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
         if (!ok || hash != region.hash) {
             // Either the slice was evicted (a game grabbed the VRAM) or the
             // copy engine returned unexpected bytes. Rebuild from the mirror.
+            --result.dmaRegions;
             ++result.mirrorRegions;
             bytes = 0;
             hash = 0;
@@ -704,6 +743,8 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
         // Invariant: never resume a process onto pages we could not prove.
         result.checksumOk = false;
         result.ok = false;
+        result.safeLockout = true;
+        safeLockout_.store(true);
         result.totalMs = timer.Ms();
         result.overheadMs = result.totalMs -
                             (result.dmaGpuMs + result.fallbackMs + result.hashVerifyMs +
@@ -724,6 +765,7 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
                         (result.dmaGpuMs + result.fallbackMs + result.hashVerifyMs +
                          result.wpmWriteMs + result.resumeMs);
     result.ok = result.checksumOk;
+    safeLockout_.store(false);
 
     {
         std::lock_guard<std::mutex> lock(statsMutex_);

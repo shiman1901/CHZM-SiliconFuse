@@ -273,6 +273,29 @@ Measured on the reference platform:
 The mirror raises freeze cost from 190 ms to 492 ms at 512 MB; that is the
 price of surviving a TDR, and it is paid once per freeze, not per restore.
 
+### 5.3 Chaos engineering, Stage 10
+
+Three failure modes were injected deliberately:
+
+1. **Unbuffered mirror.** `cryo_mirror.bin` now uses
+   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH` with sector-aligned
+   staging. `GetProcessIoCounters` confirms 512 MB written and 512 MB read back
+   from the device, and available RAM still grows by 507 MB — the Cache Manager
+   no longer parks the mirror in DDR4.
+2. **Simulated TDR.** With every D3D12 call refused (`device_removed`), restore
+   serves 0 regions from the copy engine and 13 from the NVMe mirror, verifies
+   the checksum and returns 100.0000% bit-for-bit in 256 ms.
+3. **Bit flips.** One inverted byte inside a VRAM slice is caught by the AVX2
+   checksum, the region is rejected and rebuilt from the mirror (100.0000%).
+   Inverting a byte in *both* sources makes restore fail closed: it returns an
+   error, sets `SAFE_LOCKOUT` and never resumes the process.
+4. **Mid-freeze abort.** A mirror write is failed at 50%; the freeze rolls back
+   before `MEM_RESET`, the victim keeps its original pages and stays 100% intact.
+
+Session semantics follow the same asymmetry: user-initiated exit restores every
+frozen process, while a real `WM_ENDSESSION` shutdown exits immediately and
+leaves the victims to the OS.
+
 ---
 
 ## 6. Security and governance

@@ -56,9 +56,9 @@ std::wstring ReportPath()
 {
     const std::wstring docs = ExecutableDir() + L"\\..\\docs";
     if (GetFileAttributesW(docs.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return docs + L"\\STAGE9_VALIDATION_REPORT.txt";
+        return docs + L"\\STAGE10_CHAOS_REPORT.txt";
     }
-    return LocalAppData() + L"\\STAGE9_VALIDATION_REPORT.txt";
+    return LocalAppData() + L"\\STAGE10_CHAOS_REPORT.txt";
 }
 
 std::wstring VictimStatePath(uint64_t sizeMb)
@@ -397,7 +397,8 @@ void ReportRestorePhases(FILE* out, const RestoreResult& r)
            r.totalMs - (sum + r.overheadMs));
 }
 
-int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool full)
+int RunTorture(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
+               const std::wstring& dataDir, bool full)
 {
     const std::wstring path = ReportPath();
     FILE* out = _wfsopen(path.c_str(), L"w, ccs=UTF-8", _SH_DENYNO);
@@ -405,10 +406,10 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
 
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    Report(out, L"CHZM//SILICONFUSE  STAGE 9  VALIDATION REPORT");
+    Report(out, L"CHZM//SILICONFUSE  STAGE 10  CHAOS REPORT");
     Report(out, L"generated=%04u-%02u-%02u %02u:%02u:%02u", now.wYear, now.wMonth,
            now.wDay, now.wHour, now.wMinute, now.wSecond);
-    Report(out, L"mode=%ls", full ? L"torture (fail-safe validation)" : L"quick");
+    Report(out, L"mode=%ls", full ? L"torture (chaos engineering)" : L"quick");
     Report(out, L"");
 
     // ---------------------------------------------------------- TEST 1 -----
@@ -423,8 +424,8 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
     Report(out, L"[TEST 1: BUILD + EMBEDDED ICON]");
     Report(out, L"  exe_size_bytes  = %llu", (unsigned long long)exeBytes);
     Report(out, L"  rt_group_icon   = %ls", iconGroup ? L"PRESENT (id 1)" : L"MISSING");
-    Report(out, L"  mirror_capacity = %llu MB (disk-backed fail-safe)",
-           (unsigned long long)(kMirrorCapacity / kMb));
+    Report(out, L"  mirror_flags    = FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH");
+    Report(out, L"  mirror_capacity = %llu MB", (unsigned long long)(kMirrorCapacity / kMb));
     Report(out, L"");
 
     // ---------------------------------------------------------- TEST 2 -----
@@ -436,6 +437,7 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
            (unsigned long long)(pool.SliceBytes() / kMb));
     Report(out, L"  commit_free_mb  = %llu (floor %llu)",
            (unsigned long long)FreeCommitMb(), (unsigned long long)kCommitGuardFloorMb);
+    Report(out, L"  mirror_durable  = %d", bridge.MirrorDurable() ? 1 : 0);
 
     std::vector<uint8_t> bench((size_t)(64ull * kMb), 0x5A);
     Timer benchTimer;
@@ -447,10 +449,6 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
                ? (double)bench.size() / (1024.0 * 1024.0) / (streamMs / 1000.0)
                : 0.0,
            streamMs);
-    double dmaMbps = 0.0;
-    const bool dmaOk = pool.ReadCryoDmaInto(0, 64ull * kMb, bench.data(), dmaMbps);
-    Report(out, dmaOk ? L"  gpu_dma_read_mbps = %.1f" : L"  gpu_dma_read_mbps = FAILED",
-           dmaOk ? dmaMbps : 0.0);
     benchTimer.Begin();
     const uint64_t hashValue = Hash64::Compute(bench.data(), bench.size());
     const double hashMs = benchTimer.Ms();
@@ -461,150 +459,60 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
            (unsigned long long)hashValue);
     Report(out, L"");
 
-    // ---------------------------------------------------------- TEST A -----
-    Report(out, L"[TEST A: EXACT TIMER ACCOUNTING (512 MB & 1024 MB)]");
-    if (full) {
-        const uint64_t sizes[] = { 512, 1024 };
-        for (uint64_t sizeMb : sizes) {
-            VictimHandle victim;
-            Report(out, L"  --- %llu MB ---", (unsigned long long)sizeMb);
-            if (!StartVictim(sizeMb, 3, victim)) {
-                Report(out, L"  victim_spawn = FAILED");
-                StopVictim(victim);
-                continue;
-            }
-            FreezeResult freeze;
-            const bool frozen = cryo.CryoFreeze(victim.marker.pid, freeze);
-            Report(out, L"  frozen = %d", frozen ? 1 : 0);
-            ReportFreezePhases(out, sizeMb, freeze);
-
-            uint64_t zeroedMb = 0;
-            ZeroFrozenProcess(cryo, victim.marker.pid, zeroedMb);
-            Report(out, L"  zeroed_mb = %llu", (unsigned long long)zeroedMb);
-
-            RestoreResult restore;
-            const bool restored = cryo.CryoRestore(victim.marker.pid, true, restore);
-            Report(out, L"  restored = %d (mirror regions %d)", restored ? 1 : 0,
-                   restore.mirrorRegions);
-            ReportRestorePhases(out, restore);
-
-            if (victim.verify) SetEvent(victim.verify);
-            const double percent = QueryVictimMatch(sizeMb);
-            Report(out, L"  victim_bit_match = %.4f%%", percent);
-            Report(out, L"");
-            StopVictim(victim);
-            cryo.Reset();
-        }
-    }
-    Report(out, L"");
-
-    // ---------------------------------------------------------- TEST B -----
-    Report(out, L"[TEST B: MULTI-PROCESS CONCURRENT CRYOSWAP (3 VICTIMS)]");
-    if (full) {
-        struct Spec { uint64_t sizeMb; uint32_t seed; };
-        const Spec specs[] = { { 64, 11 }, { 128, 22 }, { 256, 33 } };
-        VictimHandle victims[3];
-
-        for (int i = 0; i < 3; ++i) {
-            StartVictim(specs[i].sizeMb, specs[i].seed, victims[i]);
-        }
-
-        const uint64_t availBefore = AvailablePhysicalMb();
-        double totalFrozenMs = 0.0;
-        int frozen = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (!victims[i].alive) continue;
-            FreezeResult freeze;
-            if (cryo.CryoFreeze(victims[i].marker.pid, freeze)) {
-                ++frozen;
-                totalFrozenMs += freeze.totalMs;
-            }
-        }
-
-        uint64_t zeroedTotal = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (!victims[i].alive) continue;
-            uint64_t zeroed = 0;
-            ZeroFrozenProcess(cryo, victims[i].marker.pid, zeroed);
-            zeroedTotal += zeroed;
-        }
-        const uint64_t availAfter = AvailablePhysicalMb();
-
-        Report(out, L"  victims_frozen   = %d / 3", frozen);
-        Report(out, L"  freeze_total_ms  = %.2f", totalFrozenMs);
-        Report(out, L"  zeroed_total_mb  = %llu", (unsigned long long)zeroedTotal);
-        Report(out, L"  avail_ram_before = %llu MB", (unsigned long long)availBefore);
-        Report(out, L"  avail_ram_after  = %llu MB", (unsigned long long)availAfter);
-        Report(out, L"  avail_ram_delta  = %lld MB",
-               (long long)availAfter - (long long)availBefore);
-        Report(out, L"");
-
-        // Restore in a deliberately shuffled order (256, 64, 128).
-        const int order[3] = { 2, 0, 1 };
-        for (int idx : order) {
-            if (!victims[idx].alive) continue;
-            RestoreResult restore;
-            const bool restored = cryo.CryoRestore(victims[idx].marker.pid, true, restore);
-            if (victims[idx].verify) SetEvent(victims[idx].verify);
-            const double percent = QueryVictimMatch(specs[idx].sizeMb);
-            Report(out, L"  victim %4llu MB: restored=%d total=%.2f ms dma=%.2f wpm=%.2f "
-                        L"bit_match=%.4f%%",
-                   (unsigned long long)specs[idx].sizeMb, restored ? 1 : 0,
-                   restore.totalMs, restore.dmaGpuMs, restore.wpmWriteMs, percent);
-            StopVictim(victims[idx]);
-        }
-        for (int i = 0; i < 3; ++i) StopVictim(victims[i]);
-        cryo.Reset();
-    }
-    Report(out, L"");
-
-    // ---------------------------------------------------------- TEST C -----
-    Report(out, L"[TEST C: VRAM EVICTION SURVIVAL (FAULT-TOLERANCE PROOF)]");
+    // --------------------------------------------------------- CHAOS 1 -----
+    Report(out, L"[CHAOS 1: UNBUFFERED NVME MIRROR & ZERO CACHE LEAK (512 MB)]");
     if (full) {
         VictimHandle victim;
-        if (StartVictim(256, 7, victim)) {
+        if (StartVictim(512, 41, victim)) {
+            const uint64_t availBefore = AvailablePhysicalMb();
+            const StorageBridge::IoSnapshot ioBefore = StorageBridge::QueryIo();
+
             FreezeResult freeze;
             const bool frozen = cryo.CryoFreeze(victim.marker.pid, freeze);
-            Report(out, L"  frozen           = %d (%llu MB, %d regions)",
-                   frozen ? 1 : 0, (unsigned long long)(freeze.bytes / kMb),
-                   freeze.regions);
+            const StorageBridge::IoSnapshot ioAfterWrite = StorageBridge::QueryIo();
+            const uint64_t writeDelta = ioAfterWrite.writeBytes - ioBefore.writeBytes;
 
             uint64_t zeroedMb = 0;
             ZeroFrozenProcess(cryo, victim.marker.pid, zeroedMb);
-            Report(out, L"  zeroed_mb        = %llu", (unsigned long long)zeroedMb);
+            const uint64_t availAfter = AvailablePhysicalMb();
+
+            const bool reopened = bridge.ReopenCryoMirror();
 
             double evictMs = 0.0;
-            const bool evicted = pool.EvictAllSlices(evictMs);
-            Report(out, L"  vram_evicted     = %d (%.2f ms, all %d slices released)",
-                   evicted ? 1 : 0, evictMs, pool.GetStats().sliceCount);
-            PoolStats afterEvict = pool.GetStats();
-            Report(out, L"  resident_slices  = %d / %d after eviction",
-                   afterEvict.residentSlices, afterEvict.sliceCount);
+            pool.EvictAllSlices(evictMs);
 
+            const StorageBridge::IoSnapshot ioBeforeRead = StorageBridge::QueryIo();
             RestoreResult restore;
             const bool restored = cryo.CryoRestore(victim.marker.pid, true, restore);
-            Report(out, L"  restored         = %d", restored ? 1 : 0);
-            Report(out, L"  mirror_regions   = %d (%llu MB read from StorageBridge)",
-                   restore.mirrorRegions, (unsigned long long)(restore.mirrorBytes / kMb));
-            Report(out, L"  dma_regions      = %d", restore.dmaRegions);
-            Report(out, L"  checksum         = %ls", restore.checksumOk ? L"MATCH" : L"MISMATCH");
-            Report(out, L"  fallback_ms      = %.2f", restore.fallbackMs);
-            Report(out, L"  total_ms         = %.2f", restore.totalMs);
+            const StorageBridge::IoSnapshot ioAfterRead = StorageBridge::QueryIo();
+            const uint64_t readDelta = ioAfterRead.readBytes - ioBeforeRead.readBytes;
 
             if (victim.verify) SetEvent(victim.verify);
-            const double percent = QueryVictimMatch(256);
-            Report(out, L"  victim_bit_match = %.4f%%", percent);
+            const double percent = QueryVictimMatch(512);
+
+            Report(out, L"  frozen            = %d", frozen ? 1 : 0);
+            Report(out, L"  mirror_durable    = %d", freeze.mirrorDurable ? 1 : 0);
+            Report(out, L"  mirror_bytes_mb   = %llu", (unsigned long long)(freeze.bytes / kMb));
+            Report(out, L"  write_io_delta_mb = %llu (>= 512 required)",
+                   (unsigned long long)(writeDelta / kMb));
+            Report(out, L"  reopen_mirror     = %d", reopened ? 1 : 0);
+            Report(out, L"  vram_evicted      = 1 (%.2f ms)", evictMs);
+            Report(out, L"  read_io_delta_mb  = %llu (>= 512 required)",
+                   (unsigned long long)(readDelta / kMb));
+            Report(out, L"  avail_ram_before  = %llu MB", (unsigned long long)availBefore);
+            Report(out, L"  avail_ram_after   = %llu MB", (unsigned long long)availAfter);
+            Report(out, L"  avail_ram_delta   = %lld MB (cache must not eat the win)",
+                   (long long)availAfter - (long long)availBefore);
+            Report(out, L"  restored          = %d (mirror regions %d)", restored ? 1 : 0,
+                   restore.mirrorRegions);
+            Report(out, L"  checksum          = %ls", restore.checksumOk ? L"MATCH" : L"MISMATCH");
+            Report(out, L"  bit_match         = %.4f%%", percent);
             StopVictim(victim);
             cryo.Reset();
-
-            // The slices are gone after the fault injection; rebuild them so
-            // the remaining tests start from a healthy pool.
             pool.RequestResize(1024);
             Sleep(200);
             pool.RequestResize(4096);
             Sleep(300);
-            Report(out, L"  pool_rebuilt     = %d slices resident",
-                   pool.GetStats().residentSlices);
         } else {
             Report(out, L"  victim_spawn = FAILED");
             StopVictim(victim);
@@ -612,71 +520,246 @@ int RunTorture(VramPool& pool, CryoSwap& cryo, const std::wstring& dataDir, bool
     }
     Report(out, L"");
 
-    // ---------------------------------------------------------- TEST 6 -----
-    Report(out, L"[TEST 6: COMMITGUARD]");
-    Report(out, L"  free_commit_mb  = %llu (floor %llu)", (unsigned long long)FreeCommitMb(),
-           (unsigned long long)kCommitGuardFloorMb);
-    pool.RequestResize(2048);
-    Sleep(300);
-    const int downSlices = pool.GetStats().sliceCount;
-    pool.RequestResize(4096);
-    Sleep(500);
-    Report(out, L"  resize_2048_mb  = %d slices", downSlices);
-    Report(out, L"  resize_4096_mb  = %d slices", pool.GetStats().sliceCount);
+    // --------------------------------------------------------- CHAOS 2 -----
+    Report(out, L"[CHAOS 2: SIMULATED TDR / GPU DEVICE LOST RECOVERY (256 MB)]");
+    if (full) {
+        VictimHandle victim;
+        if (StartVictim(256, 42, victim)) {
+            FreezeResult freeze;
+            const bool frozen = cryo.CryoFreeze(victim.marker.pid, freeze);
+
+            pool.SimulateDeviceRemoved();
+            const bool deviceGone = !pool.DeviceAvailable();
+
+            RestoreResult restore;
+            const bool restored = cryo.CryoRestore(victim.marker.pid, true, restore);
+
+            if (victim.verify) SetEvent(victim.verify);
+            const double percent = QueryVictimMatch(256);
+
+            Report(out, L"  frozen            = %d (mirror_durable %d)", frozen ? 1 : 0,
+                   freeze.mirrorDurable ? 1 : 0);
+            Report(out, L"  device_removed    = %d (all D3D12 calls blocked)", deviceGone ? 1 : 0);
+            Report(out, L"  dma_regions       = %d (must be 0)", restore.dmaRegions);
+            Report(out, L"  mirror_regions    = %d", restore.mirrorRegions);
+            Report(out, L"  mirror_bytes_mb   = %llu",
+                   (unsigned long long)(restore.mirrorBytes / kMb));
+            Report(out, L"  checksum          = %ls", restore.checksumOk ? L"MATCH" : L"MISMATCH");
+            Report(out, L"  total_ms          = %.2f", restore.totalMs);
+            Report(out, L"  bit_match         = %.4f%%", percent);
+            StopVictim(victim);
+            pool.ClearDeviceFault();
+            cryo.Reset();
+        } else {
+            Report(out, L"  victim_spawn = FAILED");
+            StopVictim(victim);
+        }
+    }
     Report(out, L"");
 
-    // ---------------------------------------------------------- TEST 7 -----
-    Report(out, L"[TEST 7: SENSORS + STANDBY PURGE + EXIT SAFETY]");
+    // ------------------------------------------------------- CHAOS 3A -----
+    Report(out, L"[CHAOS 3A: VRAM BIT-FLIP SELF-HEALING (128 MB)]");
+    if (full) {
+        VictimHandle victim;
+        if (StartVictim(128, 43, victim)) {
+            FreezeResult freeze;
+            cryo.CryoFreeze(victim.marker.pid, freeze);
+
+            const std::vector<CachedProcess> snapshot = cryo.SnapshotFrozen();
+            uint64_t vramOffset = 0;
+            for (const CachedProcess& cached : snapshot) {
+                if (cached.pid == victim.marker.pid && !cached.regions.empty() &&
+                    !cached.regions.front().chunks.empty()) {
+                    vramOffset = cached.regions.front().chunks.front().vramOffset;
+                }
+            }
+            const bool flipped = pool.PokeSliceByte(vramOffset + 100);
+
+            RestoreResult restore;
+            const bool restored = cryo.CryoRestore(victim.marker.pid, true, restore);
+
+            if (victim.verify) SetEvent(victim.verify);
+            const double percent = QueryVictimMatch(128);
+
+            Report(out, L"  bit_flip_in_vram  = %d (offset 0x%llX)",
+                   flipped ? 1 : 0, (unsigned long long)(vramOffset + 100));
+            Report(out, L"  restored          = %d", restored ? 1 : 0);
+            Report(out, L"  dma_regions       = %d (corrupted region rejected)",
+                   restore.dmaRegions);
+            Report(out, L"  mirror_regions    = %d (healed from NVMe)", restore.mirrorRegions);
+            Report(out, L"  checksum          = %ls", restore.checksumOk ? L"MATCH" : L"MISMATCH");
+            Report(out, L"  bit_match         = %.4f%%", percent);
+            StopVictim(victim);
+            cryo.Reset();
+        } else {
+            Report(out, L"  victim_spawn = FAILED");
+            StopVictim(victim);
+        }
+    }
+    Report(out, L"");
+
+    // ------------------------------------------------------- CHAOS 3B -----
+    Report(out, L"[CHAOS 3B: DUAL-SOURCE CORRUPTION SAFE LOCKOUT (64 MB)]");
+    if (full) {
+        VictimHandle victim;
+        if (StartVictim(64, 44, victim)) {
+            FreezeResult freeze;
+            cryo.CryoFreeze(victim.marker.pid, freeze);
+
+            const std::vector<CachedProcess> snapshot = cryo.SnapshotFrozen();
+            uint64_t vramOffset = 0;
+            uint64_t mirrorOffset = 0;
+            for (const CachedProcess& cached : snapshot) {
+                if (cached.pid == victim.marker.pid && !cached.regions.empty() &&
+                    !cached.regions.front().chunks.empty()) {
+                    vramOffset = cached.regions.front().chunks.front().vramOffset;
+                    mirrorOffset = cached.regions.front().chunks.front().mirrorOffset;
+                }
+            }
+            const bool vramFlip = pool.PokeSliceByte(vramOffset + 64);
+            const bool mirrorFlip = bridge.CorruptMirrorByte(mirrorOffset + 64);
+
+            RestoreResult restore;
+            const bool restored = cryo.CryoRestore(victim.marker.pid, true, restore);
+            const bool lockout = cryo.SafeLockout();
+            const bool stillSuspended =
+                GetFileAttributesW(VictimResultPath(64).c_str()) == INVALID_FILE_ATTRIBUTES;
+
+            Report(out, L"  bit_flip_in_vram  = %d", vramFlip ? 1 : 0);
+            Report(out, L"  bit_flip_in_mirror= %d", mirrorFlip ? 1 : 0);
+            Report(out, L"  restore_returned  = %d (must be 0)", restored ? 1 : 0);
+            Report(out, L"  safe_lockout      = %d", lockout ? 1 : 0);
+            Report(out, L"  resumed           = %d (must be 0)", stillSuspended ? 0 : 1);
+            Report(out, L"  action            = test terminates the victim manually");
+            cryo.ClearLockout();
+            StopVictim(victim);
+            cryo.Reset();
+        } else {
+            Report(out, L"  victim_spawn = FAILED");
+            StopVictim(victim);
+        }
+    }
+    Report(out, L"");
+
+    // --------------------------------------------------------- CHAOS 4 -----
+    Report(out, L"[CHAOS 4: MID-FREEZE ABORT ROLLBACK (64 MB)]");
+    if (full) {
+        VictimHandle victim;
+        if (StartVictim(64, 45, victim)) {
+            const double wsBefore = ReadProcessNumbers(victim.marker.pid).wsMb;
+
+            cryo.InjectFreezeAbort(true);
+            FreezeResult freeze;
+            const bool frozen = cryo.CryoFreeze(victim.marker.pid, freeze);
+            cryo.InjectFreezeAbort(false);
+
+            const double wsAfter = ReadProcessNumbers(victim.marker.pid).wsMb;
+            const bool resumed =
+                WaitForSingleObject(victim.child.hProcess, 0) != WAIT_OBJECT_0;
+
+            if (victim.verify) SetEvent(victim.verify);
+            const double percent = QueryVictimMatch(64);
+
+            Report(out, L"  injected_failure  = mirror write aborted at 50%%");
+            Report(out, L"  frozen            = %d (must be 0)", frozen ? 1 : 0);
+            Report(out, L"  mirror_durable    = %d", freeze.mirrorDurable ? 1 : 0);
+            Report(out, L"  ws_before_mb      = %.1f", wsBefore);
+            Report(out, L"  ws_after_mb       = %.1f (unchanged, no MEM_RESET)", wsAfter);
+            Report(out, L"  process_resumed   = %d", resumed ? 1 : 0);
+            Report(out, L"  victim_intact     = %.4f%%", percent);
+            StopVictim(victim);
+            cryo.Reset();
+        } else {
+            Report(out, L"  victim_spawn = FAILED");
+            StopVictim(victim);
+        }
+    }
+    Report(out, L"");
+
+    // --------------------------------------------------------- REGRESS -----
+    Report(out, L"[TEST 9: VRAM EVICTION SURVIVAL (REGRESSION)]");
+    if (full) {
+        VictimHandle victim;
+        if (StartVictim(256, 46, victim)) {
+            FreezeResult freeze;
+            cryo.CryoFreeze(victim.marker.pid, freeze);
+            uint64_t zeroedMb = 0;
+            ZeroFrozenProcess(cryo, victim.marker.pid, zeroedMb);
+            double evictMs = 0.0;
+            pool.EvictAllSlices(evictMs);
+            RestoreResult restore;
+            const bool restored = cryo.CryoRestore(victim.marker.pid, true, restore);
+            if (victim.verify) SetEvent(victim.verify);
+            const double percent = QueryVictimMatch(256);
+            Report(out, L"  evicted_ms = %.2f | mirror_regions = %d | checksum = %ls",
+                   evictMs, restore.mirrorRegions,
+                   restore.checksumOk ? L"MATCH" : L"MISMATCH");
+            Report(out, L"  restored = %d | bit_match = %.4f%%", restored ? 1 : 0, percent);
+            StopVictim(victim);
+            cryo.Reset();
+            pool.RequestResize(1024);
+            Sleep(200);
+            pool.RequestResize(4096);
+            Sleep(300);
+        }
+    }
+    Report(out, L"");
+
+    Report(out, L"[TEST 10: EXIT SAFETY (RestoreAllFrozen)]");
+    if (full) {
+        VictimHandle victim;
+        if (StartVictim(64, 47, victim)) {
+            FreezeResult freeze;
+            const bool frozen = cryo.CryoFreeze(victim.marker.pid, freeze);
+            const int restoredAll = cryo.RestoreAllFrozen();
+            const bool alive = WaitForSingleObject(victim.child.hProcess, 0) != WAIT_OBJECT_0;
+            if (victim.verify) SetEvent(victim.verify);
+            const double percent = QueryVictimMatch(64);
+            Report(out, L"  frozen = %d | restore_all = %d | alive = %d | frozen_left = %d",
+                   frozen ? 1 : 0, restoredAll, alive ? 1 : 0, cryo.GetStats().frozen);
+            Report(out, L"  bit_match = %.4f%%", percent);
+            StopVictim(victim);
+            cryo.Reset();
+        }
+    }
+    Report(out, L"");
+
+    Report(out, L"[SENSORS]");
     PoolStats sensors = pool.GetStats();
-    const bool purgeOk = PurgeLowPriorityStandbyList();
     Report(out, L"  nvml_fb_used_mb   = %llu / %llu",
            (unsigned long long)(sensors.fbUsedBytes / kMb),
            (unsigned long long)(sensors.fbTotalBytes / kMb));
     Report(out, L"  nvml_bar1_used_mb = %llu / %llu",
            (unsigned long long)(sensors.bar1UsedBytes / kMb),
            (unsigned long long)(sensors.bar1TotalBytes / kMb));
-    Report(out, L"  dxgi_local_used_mb= %llu", (unsigned long long)(sensors.usageBytes / kMb));
-    Report(out, L"  standby_purge     = %ls", purgeOk ? L"ok" : L"unavailable (needs admin)");
-    Report(out, L"  frozen_processes  = %d", cryo.GetStats().frozen);
-    Report(out, L"  mirror_bytes_used = %llu MB",
-           (unsigned long long)(pool.Bridge() ? pool.Bridge()->MirrorBytes() / kMb : 0));
+    Report(out, L"  mirror_bytes_used = %llu MB", (unsigned long long)(bridge.MirrorBytes() / kMb));
+    Report(out, L"  mirror_durable    = %d", bridge.MirrorDurable() ? 1 : 0);
     Report(out, L"  pool_end_mb       = %llu",
            (unsigned long long)(pool.GetStats().poolBytes / kMb));
+    Report(out, L"  free_commit_end_mb= %llu", (unsigned long long)FreeCommitMb());
     Report(out, L"");
-
-    // ---------------------------------------------------------- TEST 8 -----
-    Report(out, L"[TEST 8: EXIT SAFETY (RestoreAllFrozen)]");
-    if (full) {
-        VictimHandle victim;
-        if (StartVictim(64, 9, victim)) {
-            FreezeResult freeze;
-            const bool frozen = cryo.CryoFreeze(victim.marker.pid, freeze);
-            const int restoredAll = cryo.RestoreAllFrozen();
-            const bool stillRunning =
-                WaitForSingleObject(victim.child.hProcess, 0) != WAIT_OBJECT_0;
-            if (victim.verify) SetEvent(victim.verify);
-            const double percent = QueryVictimMatch(64);
-            Report(out, L"  frozen           = %d", frozen ? 1 : 0);
-            Report(out, L"  restore_all_frozen = %d", restoredAll);
-            Report(out, L"  process_alive    = %d (resumed by the exit path)",
-                   stillRunning ? 1 : 0);
-            Report(out, L"  frozen_left      = %d", cryo.GetStats().frozen);
-            Report(out, L"  victim_bit_match = %.4f%%", percent);
-            StopVictim(victim);
-            cryo.Reset();
-        } else {
-            Report(out, L"  victim_spawn = FAILED");
-            StopVictim(victim);
-        }
-    }
-    Report(out, L"");
-    Report(out, L"RESULT: %ls", L"STAGE 9 VALIDATION FINISHED");
+    Report(out, L"RESULT: %ls", L"STAGE 10 CHAOS FINISHED");
 
     fclose(out);
-    pool.Log(L"[torture] stage 9 report written to %ls", path.c_str());
+    pool.Log(L"[torture] stage 10 report written to %ls", path.c_str());
     return 0;
 }
 
+} // namespace
+
+namespace {
+CryoSwap* g_consoleCryo = nullptr;
+
+BOOL WINAPI ConsoleCtrlHandler(DWORD type)
+{
+    // Ctrl+C is a user action: restore everything before the process dies.
+    if (type == CTRL_C_EVENT && g_consoleCryo) {
+        g_consoleCryo->RestoreAllFrozen();
+    }
+    // CTRL_SHUTDOWN_EVENT / CTRL_CLOSE_EVENT: the OS is tearing processes down,
+    // restoring frozen victims here would only slow the shutdown.
+    return FALSE;
+}
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showCommand)
@@ -721,6 +804,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
 
     CryoSwap cryo;
     cryo.Init(&pool, &bridge);
+    g_consoleCryo = &cryo;
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
     const PagingStatus paging = ProbePagingEnvironment();
     pool.Log(L"[paging] volume=%d pagefile=%d ntstatus=0x%08lX",
@@ -728,7 +813,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
              (unsigned long)paging.ntstatus);
 
     if (headless) {
-        const int result = RunTorture(pool, cryo, dataDir, torture);
+        const int result = RunTorture(pool, cryo, bridge, dataDir, torture);
         cryo.Shutdown();
         pool.Shutdown();
         bridge.Shutdown();

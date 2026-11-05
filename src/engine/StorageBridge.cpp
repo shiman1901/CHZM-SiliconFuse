@@ -64,6 +64,15 @@ void StorageBridge::Shutdown()
     buffer_.shrink_to_fit();
 }
 
+namespace {
+
+constexpr DWORD kMirrorSector = 4096;
+constexpr DWORD kMirrorChunk = 64u * 1024u * 1024u;
+
+bool IsAligned(uint64_t value) { return (value % kMirrorSector) == 0; }
+
+} // namespace
+
 bool StorageBridge::InitCryoMirror(const std::wstring& directory, uint64_t capacityBytes)
 {
     std::lock_guard<std::mutex> lock(mirrorMutex_);
@@ -74,9 +83,30 @@ bool StorageBridge::InitCryoMirror(const std::wstring& directory, uint64_t capac
     mirrorPath_ = directory + L"\\cryo_mirror.bin";
     mirrorCapacity_ = capacityBytes;
     mirrorBytes_.store(0);
+    mirrorDurable_.store(false);
     mirror_ = CreateFileW(mirrorPath_.c_str(), GENERIC_READ | GENERIC_WRITE,
                           FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                              FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+                          nullptr);
+    mirrorDurable_.store(mirror_ != INVALID_HANDLE_VALUE);
+    return mirror_ != INVALID_HANDLE_VALUE;
+}
+
+bool StorageBridge::ReopenCryoMirror()
+{
+    std::lock_guard<std::mutex> lock(mirrorMutex_);
+    if (mirrorPath_.empty()) return false;
+    if (mirror_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(mirror_);
+        mirror_ = INVALID_HANDLE_VALUE;
+    }
+    mirror_ = CreateFileW(mirrorPath_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                              FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+                          nullptr);
+    mirrorDurable_.store(mirror_ != INVALID_HANDLE_VALUE);
     return mirror_ != INVALID_HANDLE_VALUE;
 }
 
@@ -84,24 +114,36 @@ bool StorageBridge::WriteMirror(uint64_t offset, const void* data, uint64_t byte
 {
     if (mirror_ == INVALID_HANDLE_VALUE || !data || bytes == 0) return false;
     if (offset + bytes > mirrorCapacity_) return false;
+    // Unbuffered handles demand sector-aligned offsets, sizes and buffers.
+    if (!IsAligned(offset) || !IsAligned(bytes) ||
+        (reinterpret_cast<uintptr_t>(data) % kMirrorSector) != 0) {
+        mirrorDurable_.store(false);
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(mirrorMutex_);
     LARGE_INTEGER position{};
     position.QuadPart = (LONGLONG)offset;
-    if (!SetFilePointerEx(mirror_, position, nullptr, FILE_BEGIN)) return false;
+    if (!SetFilePointerEx(mirror_, position, nullptr, FILE_BEGIN)) {
+        mirrorDurable_.store(false);
+        return false;
+    }
 
     const uint8_t* source = static_cast<const uint8_t*>(data);
     uint64_t remaining = bytes;
     while (remaining > 0) {
-        const DWORD chunk = (DWORD)std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull);
+        const DWORD chunk = (DWORD)std::min<uint64_t>(remaining, kMirrorChunk);
         DWORD written = 0;
-        if (!WriteFile(mirror_, source, chunk, &written, nullptr) || written == 0) {
+        if (!WriteFile(mirror_, source, chunk, &written, nullptr) ||
+            written != chunk) {
+            mirrorDurable_.store(false);
             return false;
         }
         source += written;
         remaining -= written;
     }
     if (offset + bytes > mirrorBytes_.load()) mirrorBytes_.store(offset + bytes);
+    mirrorDurable_.store(true);
     return true;
 }
 
@@ -109,6 +151,10 @@ bool StorageBridge::ReadMirror(uint64_t offset, void* dst, uint64_t bytes)
 {
     if (mirror_ == INVALID_HANDLE_VALUE || !dst || bytes == 0) return false;
     if (offset + bytes > mirrorBytes_.load()) return false;
+    if (!IsAligned(offset) || !IsAligned(bytes) ||
+        (reinterpret_cast<uintptr_t>(dst) % kMirrorSector) != 0) {
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(mirrorMutex_);
     LARGE_INTEGER position{};
@@ -118,13 +164,43 @@ bool StorageBridge::ReadMirror(uint64_t offset, void* dst, uint64_t bytes)
     uint8_t* target = static_cast<uint8_t*>(dst);
     uint64_t remaining = bytes;
     while (remaining > 0) {
-        const DWORD chunk = (DWORD)std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull);
+        const DWORD chunk = (DWORD)std::min<uint64_t>(remaining, kMirrorChunk);
         DWORD read = 0;
         if (!ReadFile(mirror_, target, chunk, &read, nullptr) || read == 0) return false;
         target += read;
         remaining -= read;
     }
     return true;
+}
+
+bool StorageBridge::CorruptMirrorByte(uint64_t offset)
+{
+    if (mirror_ == INVALID_HANDLE_VALUE) return false;
+    const uint64_t sector = offset - (offset % kMirrorSector);
+    if (sector + kMirrorSector > mirrorBytes_.load()) return false;
+
+    // Unbuffered I/O needs a sector-aligned buffer.
+    auto* sectorBuffer = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, kMirrorSector, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!sectorBuffer) return false;
+    bool ok = ReadMirror(sector, sectorBuffer, kMirrorSector);
+    if (ok) {
+        sectorBuffer[offset % kMirrorSector] ^= 0xFF;
+        ok = WriteMirror(sector, sectorBuffer, kMirrorSector);
+    }
+    VirtualFree(sectorBuffer, 0, MEM_RELEASE);
+    return ok;
+}
+
+StorageBridge::IoSnapshot StorageBridge::QueryIo()
+{
+    IoSnapshot snapshot;
+    IO_COUNTERS counters{};
+    if (GetProcessIoCounters(GetCurrentProcess(), &counters)) {
+        snapshot.writeBytes = counters.WriteTransferCount;
+        snapshot.readBytes = counters.ReadTransferCount;
+    }
+    return snapshot;
 }
 
 bool StorageBridge::ReadFromStaging(uint64_t offset, void* dst, size_t length)

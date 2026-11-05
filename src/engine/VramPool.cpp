@@ -743,6 +743,7 @@ uint64_t VramPool::CryoCapacity() const
 void* VramPool::BeginSliceWrite(uint64_t offset, uint64_t bytes)
 {
     if (!sliceBytes_ || bytes == 0) return nullptr;
+    if (deviceRemoved_.load()) return nullptr;
     const size_t index = (size_t)(offset / sliceBytes_);
     const uint64_t local = offset % sliceBytes_;
 
@@ -778,6 +779,7 @@ void VramPool::EndSliceWrite(uint64_t)
 bool VramPool::ReadCryoDma(uint64_t offset, uint64_t bytes, double& mbps)
 {
     if (!sliceBytes_ || bytes == 0 || stageBytes_ == 0) return false;
+    if (deviceRemoved_.load()) return false;
 
     std::lock_guard<std::mutex> lock(opMutex_);
     const size_t index = (size_t)(offset / sliceBytes_);
@@ -825,6 +827,7 @@ bool VramPool::ReadCryoDmaInto(uint64_t offset, uint64_t bytes, void* dst,
 {
     if (!dst || !sliceBytes_ || bytes == 0 || stageBytes_ == 0) return false;
     if (bytes > stageBytes_) return false;
+    if (deviceRemoved_.load()) return false;
 
     std::lock_guard<std::mutex> lock(opMutex_);
     const size_t index = (size_t)(offset / sliceBytes_);
@@ -887,6 +890,32 @@ bool VramPool::EvictAllSlices(double& ms)
         return ok;
     }
     RequestEvictAll();
+    return true;
+}
+
+bool VramPool::PokeSliceByte(uint64_t offset)
+{
+    if (!sliceBytes_) return false;
+    const size_t index = (size_t)(offset / sliceBytes_);
+    const uint64_t local = offset % sliceBytes_;
+
+    std::lock_guard<std::mutex> lock(opMutex_);
+    if (index >= slices_.size()) return false;
+    Slice& slice = slices_[index];
+    if (!slice.resource || !slice.inVram) return false;
+
+    bool mappedHere = false;
+    if (!slice.mapped) {
+        if (FAILED(slice.resource->Map(0, nullptr, &slice.cpu))) return false;
+        slice.mapped = true;
+        mappedHere = true;
+    }
+    static_cast<uint8_t*>(slice.cpu)[local] ^= 0xFF;
+    if (mappedHere) {
+        slice.resource->Unmap(0, nullptr);
+        slice.cpu = nullptr;
+        slice.mapped = false;
+    }
     return true;
 }
 

@@ -295,6 +295,7 @@ hardware state beyond its own resources.
 | 7 | Honest GDDR6 hibernation: MEM_RESET -> DMA -> WriteProcessMemory (this release) | 512 MB returns 100% bit-for-bit after the RAM copy is wiped |
 | 8 | AVX2 checksum, sub-timers, 64/128/256/512 MB matrix (this release) | 512 MB hash < 15 ms, full restore < 350 ms |
 | 9 | Fail-safe mirror, eviction survival, exit auto-restore (this release) | 100% recovery after full VRAM eviction and a wiped RAM copy |
+| 10 | Chaos engineering: unbuffered mirror, simulated TDR, bit-flip healing (this release) | Dual-source corruption locks out safely, no resume on unproven pages |
 
 Phase 1 and later require either an NVIDIA cooperation agreement or an
 exclusive-compute configuration in which the display driver is not bound to
@@ -447,3 +448,41 @@ checksum 15.37, `MEM_RESET`+trim 48.46, overhead 19.77.
 The mirror is the new freeze bottleneck (1.8 GB/s of synchronous disk I/O). It
 is written with `WriteFile` into the OS cache, so a process crash still leaves a
 consistent file; an asynchronous variant is the obvious next optimisation.
+
+---
+
+## 12. Stage 10: chaos engineering
+
+### 12.1 The mirror no longer hides in RAM
+
+`cryo_mirror.bin` is opened with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`.
+Offsets, sizes and buffers are sector-aligned (page-aligned staging inside
+`CryoSwap`), so every byte really reaches the NVMe and the Cache Manager cannot
+park 512 MB of "freed" memory back in DDR4. `GetProcessIoCounters` supplies the
+hardware proof.
+
+### 12.2 Transactional freeze
+
+`MEM_RESET`, the quota clamp and `EmptyWorkingSet` are only executed when the
+mirror is `durable`. If a write fails half way, the whole freeze rolls back:
+`NtResumeProcess` is called and the process memory is left untouched.
+
+### 12.3 Measured results (`--torture-test`, 2026-11-05)
+
+| Chaos test | Result |
+|---|---|
+| Unbuffered mirror, 512 MB | write IO +512 MB, read IO +512 MB, available RAM +507 MB, reopen OK, 100% |
+| Simulated TDR (`device_removed`) | 0 DMA regions, 13 from NVMe, checksum MATCH, 100.0000%, 256 ms |
+| VRAM bit flip (1 byte, 128 MB) | corrupted region rejected, 1 region healed from NVMe, 100.0000% |
+| Both sources corrupted (64 MB) | restore returns 0, `SAFE_LOCKOUT`, process **not** resumed |
+| Mid-freeze abort (64 MB) | no `MEM_RESET`, working set unchanged, 100.0000% intact |
+
+### 12.4 Session semantics
+
+- `WM_QUERYENDSESSION` answers `TRUE` immediately.
+- `WM_ENDSESSION` with `wParam == TRUE` (real shutdown/reboot) exits at once and
+  does **not** restore victims — the OS is terminating them anyway, and waiting
+  would just stall the reboot.
+- Closing the program (tray `Exit`, `WM_DESTROY`) calls `RestoreAllFrozen()`.
+- `Ctrl+C` in a console host restores before exiting; `CTRL_SHUTDOWN_EVENT`
+  does not.

@@ -42,11 +42,24 @@ public:
     // Fail-safe mirror for CryoSwap hibernation. File-backed on purpose: a
     // RAM mirror would defeat the whole point of freeing physical memory, and
     // a disk mirror survives VRAM eviction, a TDR or a driver reset.
+    // Opened with FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH so the
+    // Cache Manager never hides the data in DDR4 and every byte really lands
+    // on the NVMe.
     bool InitCryoMirror(const std::wstring& directory, uint64_t capacityBytes);
+    bool ReopenCryoMirror();   // close/reopen without truncation (chaos test)
     bool WriteMirror(uint64_t offset, const void* data, uint64_t bytes);
     bool ReadMirror(uint64_t offset, void* dst, uint64_t bytes);
     uint64_t MirrorCapacity() const { return mirrorCapacity_; }
     uint64_t MirrorBytes() const { return mirrorBytes_.load(); }
+    bool MirrorDurable() const { return mirrorDurable_.load(); }
+    // Test-only: flips one byte inside the mirrored copy (Chaos 3B).
+    bool CorruptMirrorByte(uint64_t offset);
+
+    struct IoSnapshot {
+        uint64_t writeBytes = 0;
+        uint64_t readBytes = 0;
+    };
+    static IoSnapshot QueryIo();
 
 private:
     void WriterLoop();
@@ -61,6 +74,7 @@ private:
     uint64_t mirrorCapacity_ = 0;
     std::mutex mirrorMutex_;
     std::atomic<uint64_t> mirrorBytes_{ 0 };
+    std::atomic<bool> mirrorDurable_{ false };
 
     std::mutex ioMutex_;
     std::thread writer_;

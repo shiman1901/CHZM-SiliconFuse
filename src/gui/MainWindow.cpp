@@ -745,11 +745,14 @@ LRESULT MainWindow::Dispatch(UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_QUERYENDSESSION:
+        // Ask nothing, block nothing.
         return TRUE;
 
     case WM_ENDSESSION:
-        // Fail-safe: never leave a frozen process behind on logoff/shutdown.
-        if (wParam && cryo_) cryo_->RestoreAllFrozen();
+        // TRUE means Windows is really going down: every process is about to be
+        // terminated by the OS, so restoring frozen victims would only burn
+        // seconds during a reboot. Exit immediately, leave them to the OS.
+        // FALSE means the shutdown was cancelled; nothing to do.
         if (wParam) ExitProcess(0);
         return 0;
 

@@ -44,6 +44,7 @@ struct FreezeResult {
     double ingressMs = 0.0;     // rpmReadMs + vramWriteMs + hashMs
     double overheadMs = 0.0;    // totalMs - sum(phases)
     double totalMs = 0.0;
+    bool mirrorDurable = false; // every mirrored byte landed on the NVMe
 
     uint64_t origHash = 0;      // combined checksum of all cached regions
 };
@@ -57,6 +58,7 @@ struct RestoreResult {
     uint64_t mirrorBytes = 0;
     int undoRegions = 0;
     bool checksumOk = true;
+    bool safeLockout = false;   // both sources failed, process left suspended
 
     // Sub-timers (ms).
     double dmaGpuMs = 0.0;      // copy engine + fence wait
@@ -143,6 +145,10 @@ public:
 
     bool IsFrozen(DWORD pid) const;
     bool WakeNow(DWORD pid, double& wakeMs);
+    // Chaos hook: makes the mirror write fail halfway through a freeze.
+    void InjectFreezeAbort(bool on) { abortInjected_.store(on); }
+    bool SafeLockout() const { return safeLockout_.load(); }
+    void ClearLockout() { safeLockout_.store(false); }
 
     // Streams pages into the pool (self-test bench).
     bool StreamWrite(uint64_t offset, const void* data, size_t bytes);
@@ -177,4 +183,6 @@ private:
     uint32_t nextSlice_ = 0;
     uint64_t cryoUsed_ = 0;
     uint64_t mirrorUsed_ = 0;
+    std::atomic<bool> abortInjected_{ false };
+    std::atomic<bool> safeLockout_{ false };
 };
