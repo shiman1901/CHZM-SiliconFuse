@@ -1,593 +1,288 @@
-# CHZM SiliconFuse
+Русская версия: [README_RU.md](README_RU.md)
 
-**Heterogeneous Unified Memory Architecture for Windows 11**
+# CHZM-SiliconFuse
 
-Version 0.1 - Phase 0 (silicon cartography)
-Owner: CHAZM / CHZMINFINITYCORE
+Version 0.3.1. User-mode memory hierarchy engine for Windows 11 x64.
 
----
+## 1. Overview
 
-## 1. What this is
+CHZM-SiliconFuse is a user-mode engine that manages a three-tier memory
+hierarchy on a desktop PC and reclaims RAM for games:
 
-SiliconFuse is an open architecture for presenting the physically distinct
-memory of a Windows 11 workstation as a single, policy-managed address space:
+- DDR4 system memory;
+- GDDR6 video memory, exposed to the CPU through the Resizable BAR aperture;
+- NVMe storage, used as a durable mirror and spillover.
 
-- Tier 0 - system DRAM (DDR4), cache-coherent, lowest latency;
-- Tier 1 - discrete GPU framebuffer (GDDR6) exposed to the CPU through the
-  PCIe Resizable BAR aperture;
-- Tier 2 - NVMe capacity used as an emergency spillover.
+On a 16 GB machine, a modern game together with Chrome, Steam, Discord and
+Telegram can fill physical RAM. Windows then pages the game to disk, which
+produces stutter, long loads and constant page-fault activity. SiliconFuse
+reduces that pressure by moving the cold working sets of background
+applications out of DDR4 while leaving the game itself untouched.
 
-The project does **not** claim that 28 GB of identical DRAM exists. It
-implements one physical address map, one allocation protocol and one residency
-policy across three media with very different cost curves. The unified pool is
-a software contract over real silicon, not a new memory device.
+The engine works entirely in user space. It uses no kernel driver and does not
+modify the system pagefile. The mechanisms are:
 
-Phase 0 delivers the part that can be verified before any kernel code exists:
-a read-only probe that measures what the platform actually exposes. The probe
-in this repository (`CHZM_HardwareProbe.exe`) performs that measurement and
-writes the result to `docs/HARDWARE_MAP.txt`.
+- Direct3D 12 custom heaps: `D3D12_HEAP_TYPE_CUSTOM` with
+  `CPU_PAGE_PROPERTY_WRITE_COMBINE` and `MEMORY_POOL_L1`, which gives the CPU a
+  pointer into the GPU framebuffer through BAR1;
+- non-temporal AVX2 stores (`_mm256_stream_si256`) for writes into VRAM;
+- the D3D12 Copy Engine (DMA) for reads from VRAM;
+- standard Win32 and NT memory management APIs for working sets, page
+  priorities, quotas and process control.
 
----
+The result is a practical way to give a game several gigabytes of headroom on a
+16 GB system without rebooting, without a driver and without risking the
+contents of live applications.
 
-## 2. Measured reference platform
+## 2. How It Works
 
-Captured by `CHZM_HardwareProbe` v0.1 on 2026-11-05. Raw output:
-[`docs/HARDWARE_MAP.txt`](docs/HARDWARE_MAP.txt).
+The engine has two separate operating contours. They share the VRAM pool, the
+storage bridge and the hash implementation, but they have different safety
+rules.
+
+### 2.1 Contour 1: Live game mode (Safe Autopilot and Game Boost Reclaim)
+
+This is the production path for real applications and games on 16 GB systems.
+
+In Live mode the engine:
+
+- never freezes threads: `NtSuspendProcess` is not used;
+- never discards memory: `MEM_RESET` is not used;
+- never writes an old snapshot over a live process: `WriteProcessMemory` is
+  forbidden in Live mode;
+- does not use EcoQoS, so CPU frequency is not reduced and video playback in a
+  browser or a messenger interface does not stutter.
+
+**Game-Aware VRAM Yield.** When a running game is detected (`Cyberpunk2077.exe`
+and others), the engine does not allocate 1 GB slices in video memory. The game
+keeps 100 percent of its VRAM, and the engine compresses background programs in
+DDR4 instead.
+
+**Immunity Rules.** Several process roles are protected from working set
+eviction:
+
+- the game itself (`[GAME_IMMUNE]`);
+- the process family of the window that currently has focus;
+- browser GPU compositors (`--type=gpu-process`);
+- audio processes (`--type=utility`, plus any process with an active WASAPI
+  stream detected through `IAudioMeterInformation::GetPeakValue`);
+- the `Telegram.exe` interface (`[UI_PROTECTED]`).
+
+**Compression and wake mechanics.** Before a reference snapshot is copied into
+BAR1, the pages are filtered through `QueryWorkingSetEx`. Only pages with
+`VirtualAttributes.Valid == 1` are copied, that is, only pages that are
+physically resident. This avoids generating tens of thousands of page faults
+during the snapshot.
+
+Background renderers (`chrome.exe`, `steamwebhelper.exe`, `Discord.exe`) get a
+lower page priority (`ProcessMemoryPriority = 1`) and a single flush of cold
+pages (`EmptyWorkingSet`). They are not locked into a hard quota
+(`HARDWS_MAX_ENABLE` is not set).
+
+When the user switches windows (Alt+Tab, focus watcher interval 20 ms),
+`WakeGroup` works from cached handles and restores `ProcessMemoryPriority = 5`
+in 0.087 to 0.20 ms. Working set bounds are reset with explicit parameters
+(1 MB, 4096 MB, `HARDWS_MIN_DISABLE | HARDWS_MAX_DISABLE`), which avoids the
+kernel behavior in `ntoskrnl!MmAdjustWorkingSetSizeEx` where the pair `(-1, -1)`
+triggers `EmptyWorkingSet` instead of clearing the quota. A batched
+`PrefetchVirtualMemory` call follows.
+
+### 2.2 Contour 2: Hard Cryo hibernation (only with `--torture-test`)
+
+This contour performs bit-exact hibernation of a dedicated test process. It is
+not applied to live user applications.
+
+Freeze sequence:
+
+1. The target process is suspended (`NtSuspendProcess`) with a double thread
+   verification.
+2. Private RW regions are read in 64 MB chunks.
+3. An AVX2 `Hash64` checksum is computed.
+4. The data is written into GDDR6 slices through the BAR1 window.
+5. The same data is synchronously duplicated into an unbuffered NVMe mirror
+   (`cryo_mirror.bin`, 4 GB, `FILE_FLAG_NO_BUFFERING |
+   FILE_FLAG_WRITE_THROUGH`, 4096-byte alignment).
+6. Only after the mirror is durable are the physical RAM pages reset
+   (`MEM_RESET`).
+
+A transactional journal (`cryo_journal.bin`) records every state transition:
+`PREPARED -> MIRROR_DURABLE -> SOURCE_RESET -> RESTORED`.
+
+Restore sequence:
+
+1. Data is returned from GDDR6 through DMA.
+2. The AVX2 hash is verified.
+3. Corrupted blocks are automatically healed from the NVMe mirror after a bit
+   flip or a GPU loss (TDR).
+4. If both sources are damaged, the engine enters `SAFE_LOCKOUT` and does not
+   resume the process.
+
+Crash protection: an independent guard process
+(`--recovery-guard <pid>`) watches the engine. If the engine is forcefully
+terminated (`TerminateProcess`), the guard restores every affected process from
+the journal, validates `creation_time` against PID reuse, and lifts all Live
+mode restrictions.
+
+## 3. Measured Benchmarks
+
+All figures below were measured on the reference platform with the release
+binary. Raw reports are in [`docs/`](docs/) in the repository and in the
+`reports/` folder of the release package.
+
+### 3.1 Test platform
 
 | Component | Value |
 |---|---|
-| CPU | AMD Ryzen 7 5700X, 8C/16T |
-| System RAM | 16384 MB DDR4-3800, 2 x 8 GB SK Hynix HMA81GU6DJR8N-XN |
-| Usable RAM (OS) | 16293 MB |
-| GPU | NVIDIA GeForce RTX 3060 12 GB, GA106, `VEN_10DE DEV_2504` |
-| PCIe location | `09:00.0`, driver 32.0.16.1742 |
-| Framebuffer | 12288 MB GDDR6 (registry `HardwareInformation.qwMemorySize`) |
-| BAR0 | 16 MB at `0x00000000_F5000000` (registers) |
-| BAR1 | **16384 MB at `0x00000078_00000000`** (prefetchable, large-memory descriptor) |
-| Auxiliary BAR | 32 MB at `0x0000007C_00000000` |
-| Unified target | 28672 MB (16384 MB + 12288 MB) |
+| CPU | AMD Ryzen 7 5700X, 8 cores / 16 threads |
+| RAM | 16 GB DDR4-3800, dual channel |
+| GPU | NVIDIA GeForce RTX 3060 12 GB, Resizable BAR active |
+| VRAM aperture | BAR1 16384 MB, usable VRAM 11964 MB |
+| OS | Windows 11 x64 |
+| Toolchain | MinGW-w64 GCC 16.2.0, `-O2 -mavx2` |
 
-Two findings from the measurement drive the rest of the architecture.
+### 3.2 Table 1: Bus and algorithm throughput (Stages 0-8)
 
-**Finding 1 - the ReBAR aperture is 16 GB, not 12 GB.**
-A PCI BAR size must be a power of two. A 12 GB framebuffer therefore requires
-a 16 GB aperture; the upper 4 GB of the window is address space without
-backing and must never be touched. Any component that validates ReBAR by
-comparing "aperture == 12288 MB" is wrong. Correct validation is
-`aperture >= framebuffer` plus `aperture == next_power_of_two(framebuffer)`.
+| Operation | Path | Result |
+|---|---|---|
+| Write to GDDR6 through BAR1 | AVX2 `_mm256_stream_si256` | 10,866 to 10,927 MB/s |
+| Read from GDDR6 | D3D12 Copy Engine (DMA) | 8,065 to 12,580 MB/s |
+| Direct uncached CPU read from BAR1 | MMIO | 37.4 MB/s (250.6 MB/s with `MOVNTDQA`), 939.5 ns per 64-bit read |
+| AVX2 `Hash64` checksum | AVX2 xor/add/shuffle | 34.8 to 35.8 GB/s, 512 MB in 14.86 ms |
 
-**Finding 2 - the aperture is already fully committed.**
-While the probe was running, the WDDM stack reported 16355 MiB of the 16384 MiB
-BAR1 aperture in use (`nvidia-smi -q`, BAR1 Memory Usage). The GPU is not an
-idle resource waiting to be pooled; it is a live display adapter whose memory
-manager has already claimed essentially the entire window. SiliconFuse
-therefore cannot "add VRAM to RAM" by mapping BAR1 of another client. It must
-negotiate.
+The read asymmetry is the reason for the split design: writes through BAR1 are
+bandwidth-bound and reach PCIe line rate, while uncached MMIO reads are
+latency-bound. The engine therefore writes through BAR1 and reads through the
+copy engine.
 
-**Finding 3 - direct CPU access to VRAM is measurable and asymmetric.**
-`tools/ReBarBench` creates its own 64 MB D3D12 allocation with
-`HEAP_TYPE_CUSTOM / CPU_PAGE_PROPERTY_WRITE_COMBINE / MEMORY_POOL_L1` and calls
-`Map`. On this platform (WDDM 3.x, driver 32.0.16.1742) the runtime accepts the
-combination and returns a CPU pointer into GDDR6. Measured:
+### 3.3 Table 2: Real game scenario on 16 GB DDR4 (Stage 13)
+
+Scenario: Cyberpunk 2077 plus Chrome, Steam, Discord and Telegram.
+
+System state under peak load:
+
+| Metric | Before | After |
+|---|---|---|
+| Used RAM | 15.1 / 15.9 GB (95 percent) | 12.1 / 15.9 GB (76 percent) |
+| Available RAM | 820 MB | 3,800 MB |
+| Cyberpunk 2077 disk swap | 3.4 MB/s | 0 MB/s |
+
+Clean `--real-world-benchmark` pass, per process family:
+
+| Process family | Processes (protected) | Working set before, MB | Working set after, MB | Delta, MB | Private WS before, MB | Private WS after, MB | Delta, MB |
+|---|---|---|---|---|---|---|---|
+| `cyberpunk2077.exe` | 1 (1) | 4055 | 4055 | 0 | 3394 | 3394 | 0 |
+| `chrome.exe` | 28 (6) | 1280 | 153 | -1127 | 975 | 82 | -893 |
+| `steamwebhelper.exe` | 8 (5) | 578 | 195 | -382 | 348 | 25 | -323 |
+| `discord.exe` | 6 (4) | 281 | 173 | -108 | 107 | 31 | -76 |
+| `telegram.exe` | 1 (0) | 77 | 77 | 0 | 37 | 37 | 0 |
+
+Totals for the pass:
 
 | Metric | Result |
 |---|---|
-| Sequential write (AVX2 NT stores + sfence) | 10.2-10.9 GB/s |
-| Sequential read (AVX2 uncached loads) | 35-37 MB/s |
-| Sequential read (MOVNTDQA) | 250-252 MB/s |
-| Access latency | 0.80-0.94 us per 64-bit read |
-| Random 4K write | 2.0-2.8 M IOPS / 0.4-0.5 us |
-| Random 4K read | 8.9-9.6 K IOPS / 105-113 us |
-| Random 64K write | 159-174 K IOPS / 5.8-6.3 us |
-| Random 64K read | 565-595 IOPS / 1.68-1.77 ms |
-| GPU-verified integrity | PASS (copy engine readback of 64 MB) |
+| Reclaimed working set | 1637 MB |
+| Reclaimed private working set | 1299 MB |
+| `WakeGroup` restore time | 0.087 ms (`prefetch` 0.009 ms) |
+| Crashed processes | 0 |
 
-Writes are write-combined and bandwidth-bound; reads are uncached and each
-access is a separate PCIe transaction. The same allocation read through the
-copy engine reaches 12.5-12.6 GB/s. The correct Tier 1 policy is therefore:
-**write through BAR1, read through DMA.** Full capture:
-[`docs/REBAR_BENCHMARK.txt`](docs/REBAR_BENCHMARK.txt).
+The game family reports a delta of 0 MB by design (`[GAME_IMMUNE]`), and the
+Telegram interface reports 0 MB by design (`[UI_PROTECTED]`). Chrome peaked at
+3141 MB before the pass and was reduced to 124 MB.
 
----
+### 3.4 Table 3: Chrome validation bench with live JavaScript load (Stage 12.1)
 
-## 3. Tier hierarchy
+Setup: 13 Chrome processes in the background, 3 tabs with active 64 MB buffers
+in the V8 heap, checksum verification every 40 ms.
 
-| Tier | Medium | Capacity | Bandwidth (theoretical) | Access latency | Coherence |
-|---|---|---|---|---|---|
-| 0 | DDR4-3800, dual channel | 16 GB | 60.8 GB/s | 60-70 ns | CPU-coherent |
-| 1 | GDDR6 over PCIe 3.0 x16 BAR1 | 12 GB | 15.75 GB/s | ~0.6-1.5 us | not coherent |
-| 2 | NVMe SSD | policy-defined | ~3.5 GB/s | 50-100 us | block device |
-
-Tier 1 numbers are the PCIe 3.0 x16 line rate (8 GT/s per lane, 128b/130b,
-15.754 GB/s), before protocol overhead. Sustained host-to-device copies on
-this class of platform typically land at 11-13 GB/s. The GPU's own GDDR6
-bandwidth (360 GB/s on RTX 3060, 192-bit at 15 Gbps) is not available to the
-CPU and is out of scope for Tier 1.
-
----
-
-## 4. The WDDM problem
-
-Windows Display Driver Model owns the display adapter. `nvlddmkm` and the
-video memory manager (VidMm) allocate, evict and remap the framebuffer through
-the GPU page tables. A second driver cannot simply claim BAR1:
-
-- BAR1 is a CPU-visible window over the same GDDR6 that VidMm allocates;
-  writing into pages owned by a live allocation corrupts the display stack;
-- the aperture is a shared resource, not a partition - there is no hardware
-  mechanism that assigns 4 GB to one client and 8 GB to another;
-- WDDM has no public API that grants a third-party kernel driver framebuffer
-  pages outside the normal allocation path.
-
-SiliconFuse therefore defines **cooperative arbitration** instead of
-replacement:
-
-1. The pool driver never issues GPU commands and never touches the command
-   processor.
-2. It requests leases from a broker that is aware of VidMm budget pressure.
-3. A lease is revocable. When WDDM needs the pages back, the lease enters
-   `EVICTING`, data is flushed to Tier 0 or Tier 2, and the range is returned.
-4. Without a vendor-side contract (or exclusive compute mode), the only safe
-   behaviour is to refuse the lease.
-
-Details, state machine and failure handling: [`docs/ARCH_SPEC.md`](docs/ARCH_SPEC.md).
-
-### 4.1 Measured arbitration (Phase 2.1, chunked pool)
-
-`tools/LeaseBroker` now holds 4 GB as four independent 1 GB slices. The single
-4 GB allocation is refused by WDDM; four slices are granted. The pool is
-evicted only by the measured deficit, so a 6 GB load keeps half the pool
-resident while an 8 GB load takes all of it.
-
-Partial-yield capture: [`docs/WDDM_LEASE_PARTIAL.txt`](docs/WDDM_LEASE_PARTIAL.txt).
-Full-yield capture: [`docs/WDDM_LEASE_REPORT.txt`](docs/WDDM_LEASE_REPORT.txt).
-
-| Case | 6 GB load (partial) | 8 GB load (full) |
-|---|---|---|
-| Pool | 4096 MB in 4 x 1024 MB | 4096 MB in 4 x 1024 MB |
-| CPU fill, AVX2, 2048 MB dirty | 5.26 GB/s | 5.09 GB/s |
-| Deficit seen | 1039 MB | 2053 MB, then 1012 MB |
-| Slices released | 2 (2 GB) | 3, then 1 (4 GB) |
-| Resident after yield | 2048 MB | 0 MB |
-| Eviction time | 353 ms (copy 231 ms) | 1056 ms total (first release 372 ms) |
-| Restore | 224 ms (2 slices) | 472 ms (4 slices) |
-| Pressure commit | 6144 MB in 0.3 s | 8192 MB in 0.77 s |
-| Result | no TDR, final ACTIVE | no TDR, final ACTIVE |
-
-Three conclusions that matter for the design:
-
-1. **Chunking solves the 4 GB allocation.** WDDM refused one 4 GB WC L1
-   resource but granted four 1 GB resources on the same machine. The ceiling is
-   fragmentation and per-resource constraints, not framebuffer size.
-2. **Budget notifications alone are not a reliable trigger.** In several runs
-   the broker's per-process budget shrank and in others it stayed at 11 GB
-   while WDDM paged silently. Global free VRAM (`nvml.dll`, loaded dynamically)
-   is used as a second signal with a 1 GB tolerance. Without it, arbitration
-   was not deterministic.
-3. **Deficit must be bounded by a tolerance, not by the baseline.** Chasing the
-   exact pre-load free-VRAM baseline always drains the whole pool. Releasing
-   down to `baseline - 1 slice` yields 2 of 4 slices under a 6 GB load and all
-   4 under 8 GB, which is the intended behaviour.
-
-Safety note: an earlier run was started while a Cyberpunk 2077 session was
-active. The 8 GB allocation plus 4 GB pool exhausted system resources and the
-game crashed with `ERROR_NO_SYSTEM_RESOURCES`. Both tools now abort when NVML
-GPU utilization exceeds 40 percent (median of five samples) unless
-`--allow-busy` is passed, and the runner cancels if the broker exits at start.
-
-### 4.2 User-mode engine (Phase 3)
-
-`CHZM_SiliconFuse.exe` is the master binary: the same pool and arbitration
-engine, a storage bridge, and the `CHZM//INFINITYCORE` window.
-
-![CHZM//INFINITYCORE](docs/ui.png)
-
-Measured on the reference machine (log in
-`%LOCALAPPDATA%\CHZM-SiliconFuse\engine.log`):
-
-| Item | Result |
+| Metric | Result |
 |---|---|
-| Pool | 4096 MB in 4 x 1024 MB slices |
-| Dirty window | 64 MB per slice |
-| Manual eviction (4 slices) | 89.97 ms |
-| Manual restore (4 slices) | 158.91 ms |
-| Window | 920x540, dark DWM title, live RAM/VRAM/commit |
-| Autostart | HKCU Run key, toggle in the UI |
-| Close button | hides to tray; double-click restores |
+| Trimmed working set | 727 MB |
+| Trimmed private working set | 355 MB |
+| Resident page snapshot copied to GDDR6 | 146 MB |
+| Page faults during the snapshot, before the `QueryWorkingSetEx(Valid == 1)` filter | 122,902 |
+| Page faults during the snapshot, after the filter | 1,665 (73 times fewer) |
+| `restore_priority_and_quotas_ms` | 0.20 ms (about 120 times faster than 24 to 55 ms) |
+| JavaScript heap integrity | `HASH:MATCH` |
+| Crashed processes | 0 |
+| Priority recovery after `TerminateProcess` | PASS (1 -> 5) |
 
-The window is a real control surface, not a mock: the power button evicts or
-restores the pool and the numbers come from the engine. `docs/ui.png` is a
-capture of the running binary.
-
-**Pagefile attachment is not implemented.** There is no block-device driver,
-so there is no volume to format; formatting a real volume would be
-destructive; and `NtCreatePagingFile` has the signature
-`(UNICODE_STRING*, LARGE_INTEGER*, LARGE_INTEGER*, ULONG Priority)` - no
-`flags` argument and no `HybridPriority=7`. The engine logs
-`paging: not attempted` with the reason and leaves the C: pagefile untouched.
-A pagefile on a VRAM pool that evicts by design is also a direct path to
-bugcheck 0x1A/0xC2, which is exactly the failure the project must avoid.
-
----
-
-## 5. Repository layout
-
-```text
-CHZM-SiliconFuse/
-├── docs/
-│   ├── ARCH_SPEC.md          Architecture specification (tiers, WDDM, ReBAR)
-│   ├── WHITEPAPER.md         Position paper for review and publication
-│   ├── HARDWARE_MAP.txt      Raw output of the topology probe
-│   ├── REBAR_BENCHMARK.txt   Raw output of the direct-access benchmark
-│   └── WDDM_LEASE_REPORT.txt Raw output of the arbitration test
-│   └── WDDM_LEASE_PARTIAL.txt Partial-yield case (6 GB load)
-├── src/
-│   ├── engine/               VramPool, StorageBridge, PagingManager
-│   ├── gui/                  MainWindow (CHZM//INFINITYCORE)
-│   ├── kernel/               Planned WDF companion driver (Ring 0)
-│   └── common/               chzm_pool_protocol.h - shared user/kernel ABI
-├── tools/
-│   ├── HardwareProbe/        main.cpp - PCIe BAR / memory topology probe
-│   ├── ReBarBench/           main.cpp - direct MMIO vs copy-engine benchmark
-│   └── LeaseBroker/          main.cpp (broker) + gpu_pressure.cpp (load)
-├── build_probe.bat           MinGW-w64 build (and optional run) script
-├── build_bench.bat           MinGW-w64 build (AVX2, D3D12/DXGI)
-├── build_broker.bat          MinGW-w64 build (broker + pressure)
-├── build_final.bat           Master binary (engine + GUI)
-├── run_lease_test.bat        Automated arbitration test
-└── README.md
-```
-
-`src/kernel/` is intentionally empty of code. A driver that maps framebuffer
-physical pages is a security boundary and will not be published until the
-arbitration contract in `ARCH_SPEC.md` is validated.
-
----
-
-## 6. Build and run
-
-Requirements: Windows 10/11 x64, MinGW-w64 g++ 13 or newer.
-
-```bat
-build_probe.bat              :: build, run, write docs\HARDWARE_MAP.txt
-build_probe.bat --build-only :: build only
-
-build_bench.bat              :: build, run, write docs\REBAR_BENCHMARK.txt
-build_bench.bat --size 2048  :: single 2048 MB suite
-
-build_broker.bat             :: build broker + pressure emulator
-run_lease_test.bat           :: automated arbitration test, writes the report
-build_final.bat              :: master binary build\CHZM_SiliconFuse.exe
-```
-
-Output binaries: `build\CHZM_HardwareProbe.exe`,
-`build\CHZM_ReBarBench.exe` (AVX2, links `-ld3d12 -ldxgi`).
-
-The probe uses SetupAPI and the Configuration Manager only; it has no external
-dependencies and performs no writes. For display adapters,
-`CM_Get_Alloc_Log_Conf` can return `CR_FAILURE` because the graphics driver
-owns the live configuration rather than the PnP allocator. When that query
-does not yield windows, the probe falls back to the firmware-persisted
-`Enum\<instance>\LogConf\BootConfig` resource list, which contains the same BAR
-programming, and states the source explicitly in the report.
-
-Exit code 0 means an NVIDIA adapter and a non-zero memory aperture were found;
-1 means the topology could not be resolved.
-
-The benchmark allocates its own D3D12 buffers, never touches another client's
-memory, and verifies every path with bit-exact comparison. It writes no
-hardware state beyond its own resources.
-
----
-
-## 7. Roadmap
-
-| Phase | Scope | Gate |
-|---|---|---|
-| 0 | Silicon cartography (this release) | Probe reproduces the map on two platforms |
-| 1 | Host-side pool broker, user mode | Lease protocol exercised against a reserved aperture |
-| 2 | Budget-aware eviction (this release) | Broker yields on pressure, restores, no TDR |
-| 2.1 | Chunked 4 GB pool, granular eviction (this release) | 4 x 1 GB slices, partial yield under 6 GB load |
-| 3 | User-mode engine + control UI (this release) | 4 GB pool, manual/auto eviction, live UI |
-| 4 | WDF companion driver, block device, pagefile | Signed driver, IOMMU, no bugcheck in soak |
-| 5 | CryoSwap: DDR4 offload of background processes (this release) | Quota + EmptyWorkingSet, audio and foreground victims untouched |
-| 6 | CommitGuard, StandbyPurge, BAR1 telemetry (this release) | Pool never eats the WDDM commit reserve |
-| 7 | Honest GDDR6 hibernation: MEM_RESET -> DMA -> WriteProcessMemory (this release) | 512 MB returns 100% bit-for-bit after the RAM copy is wiped |
-| 8 | AVX2 checksum, sub-timers, 64/128/256/512 MB matrix (this release) | 512 MB hash < 15 ms, full restore < 350 ms |
-| 9 | Fail-safe mirror, eviction survival, exit auto-restore (this release) | 100% recovery after full VRAM eviction and a wiped RAM copy |
-| 10 | Chaos engineering: unbuffered mirror, simulated TDR, bit-flip healing (this release) | Dual-source corruption locks out safely, no resume on unproven pages |
-| 11 | Transactional journal + recovery guard, survives TerminateProcess (this release) | Victim recovered 100% after the engine is killed with exit code 99 |
-| 12 | Two modes: hard (tests) and Live Safe trim (real apps) (this release) | Chrome survives, 0 crashed tabs, 0.04 ms window ping |
-
-Phase 1 and later require either an NVIDIA cooperation agreement or an
-exclusive-compute configuration in which the display driver is not bound to
-the adapter. The project will publish negative results rather than ship an
-unsafe mapping path.
-
----
-
-## 8. Design constraints
-
-- No user-mode proxy (ImDisk, CUDA, DirectStorage shims) in the data path.
-- No undocumented GPU commands, no firmware modification, no PCI config writes.
-- Every kernel mapping must be demand-lease based and revocable.
-- The pool driver must survive adapter reset, driver update and hot-plug.
-- All diagnostics are read-only unless the operator explicitly opts in.
-
----
-
-## 9. Status and limitations
-
-- Probe status: working on the reference machine; validated against
-  `nvidia-smi` (BAR1 16384 MiB) and SMBIOS (DDR4-3800, 2 modules).
-- Benchmark status: working; direct MMIO path accepted by the runtime,
-  GPU-verified by copy-engine readback. Results in `docs/REBAR_BENCHMARK.txt`.
-- Kernel status: design only.
-- The 28 GB figure is a target envelope. Real usable capacity is always lower
-  than 28672 MB because the OS reserves RAM, VidMm owns most of the aperture,
-  and Tier 1 pages require an explicit lease.
-- PCIe link width and generation are not read by the probe. Win32 exposes no
-  supported API for the negotiated link state; the 3.0 x16 figure in this
-  document is the platform assumption, not a measurement.
-- Accepting `CUSTOM + WRITE_COMBINE + L1` is driver and WDDM-version specific.
-  The benchmark must probe it at run time; there is no API contract that
-  guarantees it across vendors.
-- A single 4 GB WC L1 allocation is refused by the driver on the reference
-  machine; four 1 GB slices are granted. The ceiling is fragmentation and
-  per-resource constraints, not the 12 GB framebuffer size.
-- Global free-VRAM telemetry comes from `nvml.dll`, loaded dynamically. It is
-  a driver component, not a D3D12 contract, and is used only because
-  per-process WDDM budgets proved unreliable as a pressure signal.
-- A heavy test must not run while a game is active. The tools now refuse to
-  start above 40 percent median GPU utilization; this guard was added after a
-  Cyberpunk 2077 session crashed during a background run.
-- The user-mode engine cannot create a block device, format a volume or attach
-  a pagefile. Those steps require a signed kernel driver and are not faked.
-  `NtCreatePagingFile` has no flags argument; the C: pagefile is untouched.
-
-See the risk section of `docs/ARCH_SPEC.md` before quoting any number from
-this repository.
-
----
-
-## 10. Stage 7-8: CryoSwap measured on the reference platform
-
-`CryoSwap` moves private pages of background processes into the GDDR6 pool,
-tells the kernel to drop them (`MEM_RESET`, so nothing is written to
-`pagefile.sys`), clamps the working set and suspends the process. Focus restores
-it: `MEM_RESET_UNDO` when the pages survived, otherwise a copy-engine DMA out of
-VRAM followed by `WriteProcessMemory`.
-
-### 10.1 Honest end-to-end matrix (2026-11-05, RTX 3060 12 GB, 32 GB DDR4)
-
-| Size | WS before | WS after | Avail RAM delta | DMA ms | Hash ms | WPM ms | Restore ms | Bit match |
-|---|---|---|---|---|---|---|---|---|
-| 64 MB | 72.7 | 24.0 | +34 MB | 8.9 | 1.71 | 18.9 | 39.22 | 100% |
-| 128 MB | 136.7 | 24.0 | +103 MB | 16.7 | 3.58 | 48.7 | 78.00 | 100% |
-| 256 MB | 264.7 | 24.0 | +220 MB | 33.1 | 7.28 | 127.3 | 176.75 | 100% |
-| 512 MB | 520.7 | 23.9 | +489 MB | 64.6 | 14.86 | 302.4 | 391.07 | 100% |
-
-Single run; `WriteProcessMemory` varies by roughly 20 percent between runs
-(249-302 ms at 512 MB), everything else stays within 2 percent.
-
-### 10.2 Sub-timers, 512 MB
-
-| Phase | Stage | ms |
-|---|---|---|
-| Freeze | suspend + thread snapshot | 20.93 |
-| Freeze | `ReadProcessMemory` | 41.92 |
-| Freeze | AVX2 write into BAR1 | 47.21 |
-| Freeze | checksum | 14.64 |
-| Freeze | `MEM_RESET` + quota + `EmptyWorkingSet` | 47.07 |
-| Restore | GPU DMA (copy engine + fence) | 64.64 |
-| Restore | checksum | 14.86 |
-| Restore | `WriteProcessMemory` | 302.44 |
-| Restore | quota release + `NtResumeProcess` | 2.51 |
-
-### 10.3 Integrity proof
-
-For every size the test forces the "data is gone" condition before restoring:
-
-- the victim's pages are overwritten with zeros through `WriteProcessMemory`;
-- `MEM_RESET` + `HARDWS_MAX` + `EmptyWorkingSet` + standby purge discard them;
-- `MEM_RESET_UNDO` returns `NULL`, so no recovery from RAM or pagefile is possible;
-- the 512 MB restore is fed only by the copy engine from the four 1 GB slices.
-
-Three hashes are recorded per size: `orig_hash`, `zeroed_hash` (differs, as it
-must) and `restored_hash` (equal to `orig_hash`), and the victim re-reads its own
-buffer after resume: **100.0000% bit-for-bit**.
-
-### 10.4 What the numbers actually mean
-
-- The AVX2 checksum runs at 34.8 GB/s (1.80 ms / 64 MB); the sequential FNV-1a
-  it replaced needed ~350 ms for 512 MB.
-- Restore is no longer DMA bound. At 512 MB the copy engine needs 64.6 ms
-  (8.1 GB/s), the checksum 14.9 ms, and `WriteProcessMemory` 302 ms (~1.7 GB/s,
-  the kernel copy is the bottleneck).
-- Freeze is bound by `ReadProcessMemory` (42 ms) and the AVX2 store into BAR1
-  (47 ms) at 512 MB; both scale linearly.
-- Mode B (`EmptyWorkingSet` alone) drops the working set to 0 MB but pays one
-  page fault per 4 KB on the next touch: 131 072 faults for 512 MB. CryoSwap
-  pays 249 ms of write-back instead and keeps the bytes in VRAM.
-- `StandbyPurge` needs `SE_PROF_SINGLE_PROCESS`; without an elevated token the
-  call is a logged no-op.
-
----
-
-## 11. Stage 9: fail-safe recovery
-
-Frozen pages are never stored in one place only. Every chunk written into a
-GDDR6 slice is also written, synchronously, into a disk-backed mirror owned by
-`StorageBridge` (`cryo_mirror.bin`, 4 GB sparse). The mirror costs throughput at
-freeze time but it is the only thing that survives a TDR, a driver reset or a
-game taking the VRAM back.
-
-Restore is a two-source state machine:
-
-1. try the copy engine from VRAM;
-2. verify the AVX2 checksum of the region;
-3. on any failure (slice evicted, DMA refused, checksum mismatch) rebuild that
-   region from the mirror and verify again;
-4. only a region proven byte-for-byte is written back with
-   `WriteProcessMemory`;
-5. `NtResumeProcess` is **never** issued for a process whose data could not be
-   proven — the process stays suspended and the event is logged as CRITICAL.
-
-### 11.1 Measured validation (`--torture-test`, 2026-11-05)
+### 3.5 Table 4: Hard Cryo hibernation and chaos engineering (Stages 7-11)
 
 | Test | Result |
 |---|---|
-| Exact timer accounting 512 MB | sum(phases) + overhead = 492.03 ms, delta 0.00 |
-| Exact timer accounting 1024 MB | sum(phases) + overhead = 930.68 ms, delta 0.00 |
-| Three victims (64/128/256 MB) frozen at once | 3/3, +307 MB available RAM, all 100.0000% after shuffled restore |
-| VRAM fully evicted while frozen | 13/13 regions recovered from the mirror, checksum MATCH, 100.0000%, 182.61 ms |
-| Exit path (`RestoreAllFrozen`) | 1/1 resumed, 0 left frozen, 100.0000% |
+| Recovery matrix, 64 / 128 / 256 / 512 / 1024 MB | 39.22 / 78.00 / 176.75 / 391.07 / 1199.94 ms, 100.0000 percent bit match |
+| Simulated GPU loss (TDR), 256 MB | 13 of 13 regions raised from the NVMe mirror in 190.92 to 256.32 ms, 100.0000 percent |
+| Bit flip in VRAM, 128 MB | corrupted chunk rejected by the AVX2 hash and healed from disk, 100.0000 percent |
+| Corruption of both sources (VRAM and disk) | `SAFE_LOCKOUT` triggered, process not resumed with damaged data |
+| Mirror write aborted at 50 percent | clean transactional rollback before `MEM_RESET`, process intact at 100.0000 percent |
+| Engine killed (`TerminateProcess`, code 99) | `--recovery-guard` restored the victim at 100.0000 percent |
+| Forged journal record with a foreign `creation_time` (PID reuse) | rejected with exit code 2 |
 
-Sub-timers for 512 MB freeze: suspend 20.46, region scan 2.05,
-`ReadProcessMemory` 45.77, AVX2 into BAR1 47.17, **mirror write 292.98**,
-checksum 15.37, `MEM_RESET`+trim 48.46, overhead 19.77.
+## 4. Repository Structure, Build and CLI
 
-The mirror is the new freeze bottleneck (1.8 GB/s of synchronous disk I/O). It
-is written with `WriteFile` into the OS cache, so a process crash still leaves a
-consistent file; an asynchronous variant is the obvious next optimisation.
+### 4.1 Repository structure
 
----
+```text
+CHZM-SiliconFuse/
+├── src/
+│   ├── main.cpp              Entry point, benchmark and test drivers, guard
+│   ├── engine/               VramPool, StorageBridge, CryoSwap, CommitGuard,
+│   │                         PagingManager, StandbyPurge, Hash64
+│   ├── gui/                  GDI interface (740x440), tray integration
+│   ├── common/               Shared user/kernel pool protocol header
+│   └── kernel/               Design notes only; no driver code is shipped
+├── docs/                     Architecture, whitepaper and measurement reports
+├── build_final.bat           Master binary build script (MinGW-w64)
+├── build_probe.bat           Hardware topology probe build
+├── build_bench.bat           Direct BAR1 and DMA benchmark build
+├── build_broker.bat          WDDM lease broker build
+├── README.md                 This document
+└── README_RU.md              Russian version
+```
 
-## 12. Stage 10: chaos engineering
+### 4.2 Build
 
-### 12.1 The mirror no longer hides in RAM
+Requirements:
 
-`cryo_mirror.bin` is opened with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`.
-Offsets, sizes and buffers are sector-aligned (page-aligned staging inside
-`CryoSwap`), so every byte really reaches the NVMe and the Cache Manager cannot
-park 512 MB of "freed" memory back in DDR4. `GetProcessIoCounters` supplies the
-hardware proof.
+- Windows 11 x64;
+- MinGW-w64 g++ with C++20 support (tested with GCC 16.2.0);
+- a CPU with AVX2;
+- a GPU with Resizable BAR enabled for the GDDR6 tier.
 
-### 12.2 Transactional freeze
+Build the master binary:
 
-`MEM_RESET`, the quota clamp and `EmptyWorkingSet` are only executed when the
-mirror is `durable`. If a write fails half way, the whole freeze rolls back:
-`NtResumeProcess` is called and the process memory is left untouched.
+```bat
+build_final.bat
+```
 
-### 12.3 Measured results (`--torture-test`, 2026-11-05)
+The script compiles `src/main.cpp` and the engine and GUI units with
+`-std=c++20 -O2 -mavx2 -static`, embeds the application icon through
+`windres`, links `d3d12`, `dxgi`, `dwmapi`, `psapi`, `gdi32`, `msimg32`,
+`shell32`, `user32`, `ole32` and `uuid`, and writes
+`build\CHZM_SiliconFuse.exe`.
 
-| Chaos test | Result |
+### 4.3 Command line modes
+
+| Command | Purpose |
 |---|---|
-| Unbuffered mirror, 512 MB | write IO +512 MB, read IO +512 MB, available RAM +507 MB, reopen OK, 100% |
-| Simulated TDR (`device_removed`) | 0 DMA regions, 13 from NVMe, checksum MATCH, 100.0000%, 256 ms |
-| VRAM bit flip (1 byte, 128 MB) | corrupted region rejected, 1 region healed from NVMe, 100.0000% |
-| Both sources corrupted (64 MB) | restore returns 0, `SAFE_LOCKOUT`, process **not** resumed |
-| Mid-freeze abort (64 MB) | no `MEM_RESET`, working set unchanged, 100.0000% intact |
+| `CHZM_SiliconFuse.exe` | GDI graphical interface, 740x440, live RAM/VRAM/commit telemetry |
+| `CHZM_SiliconFuse.exe --real-world-benchmark` | Measurement and optimization on the live system |
+| `CHZM_SiliconFuse.exe --live-combat-test` | Isolated background Chrome test with live JavaScript load |
+| `CHZM_SiliconFuse.exe --torture-test` | Full Hard Cryo stress suite (Stages 7-11) |
+| `CHZM_SiliconFuse.exe --release-all` | Forced reset of all memory quotas and priorities in the system |
 
-### 12.4 Session semantics
+### 4.4 Scope and limitations
 
-- `WM_QUERYENDSESSION` answers `TRUE` immediately.
-- `WM_ENDSESSION` with `wParam == TRUE` (real shutdown/reboot) exits at once and
-  does **not** restore victims — the OS is terminating them anyway, and waiting
-  would just stall the reboot.
-- Closing the program (tray `Exit`, `WM_DESTROY`) calls `RestoreAllFrozen()`.
-- `Ctrl+C` in a console host restores before exiting; `CTRL_SHUTDOWN_EVENT`
-  does not.
-
----
-
-## 13. Stage 11: surviving the death of the engine itself
-
-A frozen process is useless if the engine dies with it. The engine therefore
-keeps a write-through transaction journal and a separate guard process.
-
-### 13.1 Journal
-
-`cryo_journal.bin` is opened with `FILE_FLAG_WRITE_THROUGH` and rewritten on
-every state change, before the action it describes:
-
-| State | Meaning |
-|---|---|
-| 1 `PREPARED` | process known, nothing copied — a crash now only needs a resume |
-| 2 `MIRROR_DURABLE` | VRAM + NVMe copies complete, hashes recorded |
-| 3 `SOURCE_RESET` | `MEM_RESET` done, the RAM copy is gone |
-| 4 `RESTORED` | process fully returned and resumed |
-
-Each record stores `pid`, the process creation time (PID reuse protection) and
-the region table (`base`, `bytes`, `mirror_offset`, `expected_hash64`). The
-physical sector size of the volume is queried with
-`IOCTL_STORAGE_QUERY_PROPERTY` and reported (4096 bytes here).
-
-### 13.2 Guard
-
-The engine spawns `CHZM_SiliconFuse.exe --recovery-guard <own_pid>` with
-`CREATE_NO_WINDOW`. It opens a `SYNCHRONIZE` handle on the engine and waits. If
-the engine disappears:
-
-- all records `RESTORED` → exit 0, nothing to do;
-- records at `MIRROR_DURABLE`/`SOURCE_RESET` → the engine was killed: verify the
-  creation time, rebuild every region from the mirror, check the AVX2 hash, write
-  with `WriteProcessMemory`, lift the quota, `NtResumeProcess`, mark `RESTORED`;
-- records at `PREPARED` → just lift the quota and resume;
-- creation-time mismatch → refuse, log, exit 2 (never touch a recycled PID).
-
-The same replay runs at engine start, in case both the engine and the guard were
-killed.
-
-### 13.3 Measured (`--torture-test`, 2026-11-05)
-
-| Scenario | Result |
-|---|---|
-| Engine killed with `TerminateProcess(worker, 99)` while a 128 MB victim was frozen | journal `SOURCE_RESET` → guard restores → `RESTORED`, victim **100.0000%** bit-for-bit |
-| Forged journal record with a wrong creation time | guard exits 2, record stays at `SOURCE_RESET`, target process untouched and 100% intact |
-| Unbuffered mirror regression (512 MB) | write IO +512 MB, read IO +512 MB, available RAM +473 MB |
-| Simulated TDR, bit flips, mid-freeze abort | all still pass (regressions) |
-
-### 13.4 Shutdown semantics, final form
-
-`WM_ENDSESSION(wParam == TRUE)` now inspects `lParam`:
-
-- `ENDSESSION_CLOSEAPP` (Restart Manager closing only this app) →
-  `RestoreAllFrozen()` first, then exit;
-- `lParam == 0` or `ENDSESSION_LOGOFF` (real logoff/reboot) → immediate
-  `ExitProcess(0)`, no restore delay.
-
----
-
-## 14. Stage 12: hard mode vs live mode
-
-Suspending a live browser is unsafe: Chrome's own watchdog kills tabs when its
-message loop stops. The engine therefore has two explicit modes.
-
-| | Hard (tests only) | Live Safe (GUI default) |
-|---|---|---|
-| Entry point | `--torture-test` | `[RUN CRYO]`, autopilot |
-| Threads | `NtSuspendProcess` | **never touched** |
-| RAM copy | `MEM_RESET` (discarded) | **kept intact** |
-| VRAM | only surviving copy | hot cache (48 MB per process) |
-| Wake | DMA + `WriteProcessMemory` + resume | lift quota + DMA warm + `PrefetchVirtualMemory` |
-| Group wake | single pid | whole `chrome.exe` group |
-
-Live trim per process: `VirtualQueryEx` + `ReadProcessMemory` of up to 48 MB of
-hot pages, AVX2 streaming into the pool, then
-`SetProcessWorkingSetSizeEx(4 MB, 32 MB, HARDWS_MAX)` + `EmptyWorkingSet` +
-EcoQoS. No suspension, no discarding, so any crash of the engine leaves the
-applications untouched.
-
-### 14.1 Measured live run (2026-11-05, Chrome 20 processes, AI Studio tab)
-
-| Metric | Value |
-|---|---|
-| Chrome processes before / after | 20 / 20 |
-| Crashed tabs | 0 |
-| Window ping (`SendMessageTimeoutW`, `WM_NULL`) | 0.04 ms |
-| Hung windows (`IsHungAppWindow`) | 0 |
-| Processes trimmed in the pass | 4 |
-| Hot cache streamed into GDDR6 | 192 MB |
-| Physical working set released | 767 MB |
-| Cycle time | 110 ms |
-| Processes left with `NtSuspendProcess` | **0** |
-
-Chrome itself was in the foreground during this run, so the engine skipped it
-by design (`chrome_foreground = 1`); the thread-safety proof comes from three
-warm processes that were trimmed and still answered their event immediately
-(`warm_reacted = 3/3`).
-
-`--release-all` exists as an emergency cleanup: it lifts the working-set quota
-and the EcoQoS flag from every process the user can open with
-`PROCESS_SET_QUOTA`.
+- Hard Cryo is available only through `--torture-test` and is not applied to
+  live applications. Live mode is the safe path for everyday use.
+- The engine is user mode only. It does not create a block device, does not
+  format a volume and does not attach or modify a pagefile.
+- `StandbyPurge` requires an elevated token. Without elevation the call is a
+  logged no-op.
+- Acceptance of `D3D12_HEAP_TYPE_CUSTOM` with `WRITE_COMBINE` and
+  `MEMORY_POOL_L1` depends on the GPU driver and the WDDM version. The
+  benchmark probes this combination at run time.
+- A single 4 GB write-combined L1 allocation is refused on the reference
+  machine. Four 1 GB slices are granted; the engine uses slices.
+- All figures come from the reference platform listed in section 3.1. Results
+  on other hardware will differ.
