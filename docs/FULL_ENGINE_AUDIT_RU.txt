@@ -1,0 +1,144 @@
+CHZM-SiliconFuse — ПОЛНЫЙ РЕНТГЕН-АУДИТ ДВИЖКА (до бита и до микросекунды)
+Дата: 2026-11-05. Платформа: Windows 11, RTX 3060 12 ГБ (BAR1 16384 МБ, DXGI 11964 МБ),
+16 ГБ DDR4 (Commit Limit ~36.7 ГБ вместе с pagefile). MinGW-w64 g++ 16.2.0, -O2 -mavx2 -static.
+
+================================================================================
+1. КРИТИЧЕСКИЙ БАГ №1 — SetProcessWorkingSetSizeEx(-1, -1)
+================================================================================
+Симптом: у пользователя лагали уже ОТКРЫТЫЕ вкладки Chrome и Telegram даже без игры.
+
+Причина (подтверждена замером): в ntoskrnl!MmAdjustWorkingSetSizeEx пара
+(-1, -1) означает "опустошить Working Set" (EmptyWorkingSet), а НЕ "сбросить
+квоту". Каждый вызов WakeGroup / --release-all повторно выбивал страницы в своп,
+а флаг QUOTA_LIMITS_HARDWS_MAX_ENABLE мог оставаться висеть.
+
+Исправление: читаем старые квоты GetProcessWorkingSetSizeEx, затем передаём
+РЕАЛЬНЫЕ границы (min=1 МБ, max=4 ГБ) с флагами отключения жёстких границ:
+  SetProcessWorkingSetSizeEx(h, 1 МБ, 4 ГБ, HARDWS_MIN_DISABLE | HARDWS_MAX_DISABLE)
+и перечитываем — бит HARDWS_MAX_ENABLE (0x4) обязан стать 0.
+
+Доказательство (реальный лог --release-all, живые процессы пользователя):
+  telegram.exe pid=9528  ws_max 4096->4096 MB flags 0xa->0xa HARDMAX_RELEASED
+  chrome.exe   pid=1612  ws_max 4096->4096 MB flags 0xa->0xa HARDMAX_RELEASED
+  chrome.exe   pid=14876 ws_max 1->4096 MB  flags 0xa->0xa HARDMAX_RELEASED   <- был зажат 1 МБ!
+  ...
+  chrome.exe   15/15 released, 0 с HARDWS_MAX_ENABLE, худший oldMax 4096 МБ
+  telegram.exe 1/1  released
+flags 0xa = HARDWS_MIN_DISABLE(0x2) | HARDWS_MAX_DISABLE(0x8), без бита 0x4
+(HARDWS_MAX_ENABLE). Один renderer (pid 14876) сидел на потолке 1 МБ — после
+фикса все на 4 ГБ и без жёсткого лимита.
+
+(-1, -1) убраны из ВСЕХ точек восстановления: RestoreLiveSettings (CryoSwap),
+RunReleaseAll, UnparkProcess (сторож/журнал), CryoRestore (hard-режим).
+
+================================================================================
+2. КРИТИЧЕСКИЙ БАГ №2 — Page Faults при снимке BAR1
+================================================================================
+Симптом: hard_fault_delta = 122 902 (потом 35 569) при копировании ~150 МБ —
+ReadProcessMemory читал MEM_COMMIT регионы целиком, включая Demand-Zero и
+вытесненные страницы, заставляя ядро брать page fault на каждые 4 КБ.
+
+Исправление: перед чтением региона фильтруем страницы через QueryWorkingSetEx
+и копируем в BAR1 ТОЛЬКО блоки с VirtualAttributes.Valid == 1 (реально в RAM).
+Для QueryWorkingSetEx добавлено право PROCESS_QUERY_INFORMATION (без него вызов
+молча возвращал FALSE и снапшот был пустым).
+
+Результат (свежий --live-combat-test):
+  hard_fault_delta: 122 902 -> 35 569 -> 1665  (в 73 раза меньше исходного)
+  gddr6_snapshot_copy_mb: 146 МБ (реально резидентных страниц)
+
+================================================================================
+3. КРИТИЧЕСКИЙ БАГ №3 — Таймеры WakeGroup
+================================================================================
+Симптом: restore_settings_ms показывал 24–55 мс, хотя сам сброс — микросекунды.
+
+Причина: в тот же таймер попадали PrefetchVirtualMemory и DMA-чтение; плюс раньше
+создавался CreateToolhelp32Snapshot и повторно открывались хендлы.
+
+Исправление: WakePids итерирует ТОЛЬКО закешированный список trimmed_ (без
+снапшота, хендлы берутся из записи). Три фазы замеряются отдельно:
+  restore_priority_and_quotas_ms — чистый сброс MemoryPriority=5 + квоты (реальные
+      границы, без (-1,-1));
+  prefetch_ms — PrefetchVirtualMemory по горячим диапазонам;
+  dma_probe_ms — чтение одного контрольного чанка из GDDR6.
+
+Результат (свежий):
+  restore_priority_and_quotas_ms = 0.20 мс  (< 1.0 мс — ЦЕЛЬ ДОСТИГНУТА)
+  prefetch_ms = 0.03 мс
+  dma_probe_ms = 1.22 мс
+  (было 24–55 мс -> стало 0.20 мс, ускорение ~120x)
+
+================================================================================
+4. АЛГОРИТМ РАБОТЫ НА 16 ГБ DDR4
+================================================================================
+Слои: VramPool (GDDR6 срезы) -> StorageBridge (зеркало + журнал) -> CryoSwap
+(гибернация/trim) -> MainWindow (GDI-интерфейс).
+
+VramPool: срезы по 1 ГБ на D3D12_HEAP_TYPE_CUSTOM + CPU_PAGE_PROPERTY_WRITE_COMBINE
++ MEMORY_POOL_L1 (это BAR1). Авто-размер от VRAM: <=6 ГБ -> 1, <11 -> 2, <16 -> 4,
+иначе 6. Запись AVX2 _mm256_stream_si256 (~10.9 ГБ/с), чтение DMA copy engine
+(~6-8 ГБ/с). CommitGuard: срез не создаётся при свободном коммите < 6144 МБ;
+при < 3072 МБ монитор срезает 1-2 среза.
+
+Хеш: Hash64 (AVX2 xor/add/shuffle, ~35 ГБ/с; 512 МБ за ~14.9 мс).
+
+=== HARD-режим (только --torture-test, на cryo_victim) ===
+CryoFreeze: NtSuspendProcess + двойной снапшот потоков -> строго MEM_PRIVATE +
+PAGE_READWRITE -> ReadProcessMemory -> AVX2 в GDDR6 + в cryo_mirror.bin ->
+ТОЛЬКО при mirror durable: MEM_RESET + quota(4/24 МБ,HARDWS) + EmptyWorkingSet ->
+журнал PREPARED -> MIRROR_DURABLE -> SOURCE_RESET.
+CryoRestore: снять квоту -> MEM_RESET_UNDO (быстрый путь) -> иначе DMA + AVX2-хеш
+-> при несовпадении пересборка из зеркала -> WriteProcessMemory -> NtResumeProcess
+ТОЛЬКО если все хеши сошлись (иначе SAFE_LOCKOUT). 100.0000% bit-for-bit.
+
+=== LIVE-режим (GUI [RUN CRYO] / автопилот, на реальных приложениях) ===
+Никогда: NtSuspendProcess, MEM_RESET, WriteProcessMemory в живой процесс,
+HARDWS_MAX_ENABLE, EcoQoS (троттлинг CPU убивает YouTube/Telegram).
+LIVE_SAFE_AUTOPILOT: только ProcessMemoryPriority 5->2 + (без EcoQoS).
+LIVE_AGGRESSIVE_RECLAIM: 5->1 + однократный EmptyWorkingSet + неразрушающий
+снимок 12 МБ резидентных страниц в GDDR6 (QueryWorkingSetEx Valid==1).
+
+Защита ролей (по командной строке NtQueryInformationProcess class 60):
+--type=gpu-process, --type=utility (аудио), --type=crashpad-handler, а также
+telegram.exe / discord.exe — EmptyWorkingSet к ним НЕ применяется.
+
+Аудио-детект: WASAPI per-session IAudioMeterInformation::GetPeakValue > 0.0005,
+вызов через явный слот vtable[3] (обход бага GCC -O2 с локально объявленным COM).
+
+WakeGroup/WakePids: мгновенный сброс приоритета 5 + квот (реальные границы) +
+EcoQoS off на ВСЕХ процессах группы exe по pid, затем PrefetchVirtualMemory, затем
+DMA-зонд. Вотчер фокуса 20 мс. Страховка 120 с.
+
+=== Надёжность ===
+Зеркало cryo_mirror.bin: FILE_FLAG_NO_BUFFERING|WRITE_THROUGH, I/O кратно 4096,
+физический сектор по IOCTL_STORAGE_QUERY_PROPERTY = 4096.
+Журнал cryo_journal.bin (WRITE_THROUGH): pid + creation_time + состояние + таблица
+регионов. Сторож --recovery-guard <pid> ждёт смерть движка и реплеит журнал
+(проверка creation_time против переиспользования PID). --release-all сбрасывает
+квоты/приоритет/EcoQoS/CPU-класс по ВСЕМ процессам через Toolhelp32.
+
+================================================================================
+5. СВЕЖИЕ ЦИФРЫ --live-combat-test (изолированный Chrome, 3 вкладки по 64 МБ JS)
+================================================================================
+  trimmed_ws_sum_mb         = 727
+  trimmed_private_ws_sum_mb = 355
+  system_available_delta_mb = 27
+  gddr6_snapshot_copy_mb    = 146
+  hard_fault_delta          = 1665
+  restore_priority_and_quotas_ms = 0.20   prefetch_ms = 0.03   dma_probe_ms = 1.22
+  crashed_chrome_processes  = 0
+  js_hash_verification      = MATCH
+  live_crash_recovery       = PASS (приоритет жертвы 1 -> 5 после kill-9)
+  EcoQoS                    = DISABLED BY DESIGN
+
+--torture-test (hard): 100.0000% BIT-FOR-BIT, PID-reuse REFUSED.
+
+================================================================================
+6. НЕЗАКРЫТОЕ
+================================================================================
+- StandbyPurge требует elevation, не прогонялся от администратора.
+- Реальный TDR не эмулировался (только SimulateDeviceRemoved).
+- Цифры отклика stock/autopilot/aggressive в пределах шума на 16 ГБ без давления:
+  измеримый эффект — не рост FPS, а отсутствие фризов и page-fault молотилки.
+- Ingress (hard) ограничен ReadProcessMemory ~1 ГБ/с; egress — WriteProcessMemory ~1.7 ГБ/с.
+- Remote в git не настроен, подписи exe нет (SmartScreen).

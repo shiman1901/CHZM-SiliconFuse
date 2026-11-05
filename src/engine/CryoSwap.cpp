@@ -269,6 +269,70 @@ uint64_t CombineHashes(const std::vector<uint64_t>& hashes)
 }
 
 // Committed, readable regions worth caching (live trim uses a small budget).
+
+// Candidate regions filtered by QueryWorkingSetEx so only pages that are
+// physically resident right now are read: ReadProcessMemory no longer takes a
+// page fault per 4 KB on demand-zero / paged-out pages.
+std::vector<WIN32_MEMORY_RANGE_ENTRY> CollectResidentRanges(HANDLE process,
+                                                            uint64_t limit)
+{
+    constexpr uint64_t kMaxRegionTake = 64ull * kMb;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    MEMORY_BASIC_INFORMATION info{};
+    uint64_t total = 0;
+    const uint8_t* address = nullptr;
+    const uint8_t* limitAddress = reinterpret_cast<const uint8_t*>(0x7FFFFFFF0000ull);
+
+    while (address < limitAddress && total < limit) {
+        if (VirtualQueryEx(process, address, &info, sizeof(info)) != sizeof(info)) break;
+        const uint8_t* base = static_cast<const uint8_t*>(info.BaseAddress);
+        const uint64_t size = (uint64_t)info.RegionSize;
+        const DWORD protect = info.Protect;
+        const bool readable =
+            info.State == MEM_COMMIT && (protect & PAGE_GUARD) == 0 &&
+            (protect & PAGE_NOACCESS) == 0 &&
+            (protect & (PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_WRITECOPY |
+                        PAGE_EXECUTE_WRITECOPY)) != 0;
+
+        if (readable && size >= 4096) {
+            const uint64_t budget =
+                std::min(std::min(size, kMaxRegionTake), limit - total);
+            const uint64_t pageCount = budget / 4096;
+            std::vector<PSAPI_WORKING_SET_EX_INFORMATION> ws(pageCount);
+            for (uint64_t i = 0; i < pageCount; ++i) {
+                ws[i].VirtualAddress = const_cast<void*>(
+                    reinterpret_cast<const void*>(base + i * 4096));
+            }
+            if (QueryWorkingSetEx(process, ws.data(),
+                                  (DWORD)(pageCount * sizeof(ws[0])))) {
+                uint64_t run = 0;
+                for (uint64_t i = 0; i <= pageCount; ++i) {
+                    const bool valid =
+                        (i < pageCount) && ws[i].VirtualAttributes.Valid;
+                    if (valid) {
+                        ++run;
+                        continue;
+                    }
+                    if (run > 0) {
+                        const uint64_t runStart = i - run;
+                        WIN32_MEMORY_RANGE_ENTRY entry{};
+                        entry.VirtualAddress =
+                            const_cast<uint8_t*>(base) + runStart * 4096;
+                        entry.NumberOfBytes = (SIZE_T)(run * 4096);
+                        ranges.push_back(entry);
+                        total += run * 4096;
+                        run = 0;
+                    }
+                }
+            }
+        }
+        if (size == 0) break;
+        address = base + size;
+        if (address <= base) break;
+    }
+    return ranges;
+}
+
 std::vector<WIN32_MEMORY_RANGE_ENTRY> CollectHotRanges(HANDLE process, uint64_t limit)
 {
     constexpr uint64_t kMaxRegionTake = 64ull * kMb;
@@ -745,7 +809,10 @@ bool CryoSwap::CryoRestore(DWORD pid, bool forceDma, RestoreResult& result)
 
     Timer stepTimer;
     stepTimer.Begin();
-    SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0);
+    SetProcessWorkingSetSizeEx(process, 1024ull * 1024ull,
+                                4096ull * 1024ull * 1024ull,
+                                QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+                                    QUOTA_LIMITS_HARDWS_MAX_DISABLE);
     ApplyEcoQos(process, false);
     result.resumeMs += stepTimer.Ms();
 
@@ -1039,7 +1106,7 @@ bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE proce
 
     // Step 2: non-destructive hot snapshot into GDDR6 (transport probe).
     const std::vector<WIN32_MEMORY_RANGE_ENTRY> hot =
-        CollectHotRanges(process, kLiveHotBytes);
+        CollectResidentRanges(process, kLiveHotBytes);
     AlignedBuffer bounce((size_t)kChunk);
     uint64_t copied = 0;
     if (bounce.data) {
@@ -1098,7 +1165,13 @@ void CryoSwap::RestoreLiveSettings(HANDLE process)
 {
     WriteMemoryPriority(process, kMemoryPriorityNormal);
     ApplyEcoQos(process, false);
-    SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1,
+
+    // (-1, -1) means "EmptyWorkingSet" to MmAdjustWorkingSetSizeEx, NOT "reset
+    // the quota": the hard ceiling stayed on and every release re-flushed the
+    // process to swap. Real bounds plus the disable bits are the correct call.
+    constexpr SIZE_T kRestoreMin = 1024ull * 1024ull;             // 1 MB
+    constexpr SIZE_T kRestoreMax = 4096ull * 1024ull * 1024ull;   // 4 GB
+    SetProcessWorkingSetSizeEx(process, kRestoreMin, kRestoreMax,
                                QUOTA_LIMITS_HARDWS_MIN_DISABLE |
                                    QUOTA_LIMITS_HARDWS_MAX_DISABLE);
 }
@@ -1120,6 +1193,7 @@ int CryoSwap::TrimPids(const std::vector<DWORD>& pids, LiveTrimMode mode)
         if (IsTrimmed(pid) || IsFrozen(pid)) continue;
 
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                         PROCESS_QUERY_INFORMATION |
                                          PROCESS_VM_READ | PROCESS_SET_QUOTA |
                                          PROCESS_SET_INFORMATION,
                                      FALSE, pid);
@@ -1280,6 +1354,7 @@ int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs
         }
     }
 
+    // Phase 1: pure settings reset on cached handles (no snapshot, no I/O).
     Timer settingsTimer;
     settingsTimer.Begin();
     for (const TrimmedProcess& entry : group) {
@@ -1297,8 +1372,9 @@ int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs
     }
     restoreSettingsMs = settingsTimer.Ms();
 
-    AlignedBuffer staging((size_t)kChunk);
-    double bestMbps = 0.0;
+    // Phase 2: batch prefetch (separate timer).
+    Timer prefetchTimer;
+    prefetchTimer.Begin();
     for (const TrimmedProcess& entry : group) {
         HANDLE process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
                                      FALSE, entry.pid);
@@ -1312,6 +1388,15 @@ int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs
             CloseHandle(process);
         }
         if (entry.handle) CloseHandle(entry.handle);
+    }
+    const double prefetchMs = prefetchTimer.Ms();
+
+    // Phase 3: single GDDR6 telemetry probe.
+    AlignedBuffer staging((size_t)kChunk);
+    double bestMbps = 0.0;
+    Timer dmaTimer;
+    dmaTimer.Begin();
+    for (const TrimmedProcess& entry : group) {
         if (staging.data && !entry.chunks.empty()) {
             double mbps = 0.0;
             const CachedChunk& probe = entry.chunks.front();
@@ -1322,17 +1407,21 @@ int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs
             }
         }
     }
+    const double dmaProbeMs = dmaTimer.Ms();
 
     {
         std::lock_guard<std::mutex> lock(statsMutex_);
         liveMetrics_.restoreSettingsMs = restoreSettingsMs;
+        liveMetrics_.restorePriorityQuotasMs = restoreSettingsMs;
+        liveMetrics_.prefetchMs = prefetchMs;
+        liveMetrics_.dmaProbeMs = dmaProbeMs;
         stats_.lastWakeMs = restoreSettingsMs;
         stats_.lastEgressMBps = bestMbps;
         stats_.trimmed = (int)trimmed_.size();
     }
     if (!group.empty()) {
-        Log(L"[cryo] woke %zu processes: settings=%.2f ms dma=%.1f MB/s",
-            group.size(), restoreSettingsMs, bestMbps);
+        Log(L"[cryo] woke %zu: restore=%.3f ms prefetch=%.3f ms dma=%.3f ms",
+            group.size(), restoreSettingsMs, prefetchMs, dmaProbeMs);
     }
     return (int)group.size();
 }

@@ -1,34 +1,34 @@
 ﻿CHZM//SILICONFUSE  STAGE 12.1  CHROME VALIDATION REPORT
-generated=2026-11-05 18:23:07
+generated=2026-11-05 18:42:22
 
 [PHASE 0: ISOLATED CHROME STAND]
   profile_dir    = C:\Users\CHAZM\AppData\Local\CHZM-SiliconFuse\..\Temp\CHZM_Stage12_1_Profile
   chrome_path    = C:\Program Files\Google\Chrome\Application\chrome.exe
-  chrome_root_pid= 15356
+  chrome_root_pid= 13828
   group_size     = 13
 
   PID     Parent  WS_MB   PrivWS_MB  Faults     Priority
-  15356   0         129.6       42.1      38089        5
-  13072   0          10.6        3.5       3012        5
-  8324    0          82.9       97.1      38775        5
-  7384    0          35.8       12.6      10157        5
-  11176   0          16.6        7.6       4708        5
-  14216   0          90.3       51.1      29752        5
-  4760    0         114.3       82.3      30542        5
-  9456    0         127.2       87.4      34105        5
-  10740   0         114.6       82.6      30509        5
-  14736   0          29.5       14.4       8428        5
-  3448    0          37.7       19.0      10594        5
-  13540   0          37.5       18.8      10547        5
-  512     0          39.8       19.5      11105        5
+  13828   0         127.1       41.4      37032        5
+  10664   0          10.7        3.5       3026        5
+  8012    0          82.8       92.6      38693        5
+  2764    0          36.4       12.5      10363        5
+  4680    0          16.6        7.6       4727        5
+  14404   0          91.8       50.8      30109        5
+  3464    0         117.3       85.4      31299        5
+  15296   0         117.8       85.0      31667        5
+  7620    0         114.7       82.6      30595        5
+  15300   0          29.5       14.4       8471        5
+  10704   0          40.4       21.7      11239        5
+  12016   0          37.5       18.8      10563        5
+  9444    0          42.6       22.2      11839        5
 
-  window hwnd=0x0000000000040658 pid=15356 title=CHZM_LIVE_OK|TICKS:64|MAX_JITTER_MS:13.90|HASH:MATCH|MB:64 - Google Chrome
+  window hwnd=0x00000000001D05EC pid=13828 title=CHZM_LIVE_OK|TICKS:68|MAX_JITTER_MS:14.40|HASH:MATCH|MB:64 - Google Chrome
   chrome_foreground = 0 (must be 0)
 
 [PHASE 1: BASELINE - WINDOWS STOCK]
-  tick  p50=0.41 p95=0.46 p99=0.47 max=0.58 ms
-  ping  p50=0.02 p95=0.39 p99=0.56 max=0.75 ms (420 pings)
-  avail_ram 8501 -> 8772 MB
+  tick  p50=0.47 p95=0.50 p99=0.51 max=0.51 ms
+  ping  p50=0.05 p95=0.46 p99=0.66 max=0.91 ms (158 pings)
+  avail_ram 8953 -> 8960 MB
 
 [PHASE 2: LIVE_SAFE_AUTOPILOT]
   processes      = 13
@@ -36,29 +36,31 @@ generated=2026-11-05 18:23:07
   ws_sum_mb      = 0
   priv_sum_mb    = 0
   sys_avail_delta= 0 MB
-  tick  p50=0.32 p95=0.46 p99=0.50 max=0.64 ms
-  ping  p50=0.03 p95=0.11 p99=0.62 max=0.83 ms
-  restore_settings_ms = 55.70
+  tick  p50=0.49 p95=0.50 p99=0.51 max=0.52 ms
+  ping  p50=0.05 p95=0.39 p99=0.42 max=0.49 ms
+  restore_settings_ms = 0.37
 
 [PHASE 3: LIVE_AGGRESSIVE_RECLAIM]
   processes      = 13
-  trimmed_ws_sum_mb      = 214
-  trimmed_private_ws_sum_mb = 204
-  system_available_delta_mb = 3
+  trimmed_ws_sum_mb      = 727
+  trimmed_private_ws_sum_mb = 355
+  system_available_delta_mb = 27
   commit_delta_mb           = 0
-  gddr6_snapshot_copy_mb    = 156
-  hard_fault_delta          = 35569
-  elapsed_ms                = 94
+  gddr6_snapshot_copy_mb    = 146
+  hard_fault_delta          = 1665
+  elapsed_ms                = 108
   alive_after    = 13 / 13 (crashed=0)
-  tick  p50=0.37 p95=0.46 p99=0.47 max=0.53 ms
-  ping  p50=0.02 p95=0.04 p99=0.47 max=0.72 ms
+  tick  p50=0.49 p95=0.51 p99=0.53 max=0.57 ms
+  ping  p50=0.04 p95=0.56 p99=0.66 max=0.68 ms
 
 [PHASE 4: WAKE (ALT+TAB) + JS INTEGRITY]
   woken_processes     = 13
-  wake_latency_ms     = 30.98
-  restore_settings_ms = 29.03
-  ping100 p50=0.033 p95=0.102 p99=0.888 max=8.472 ms
-  window_title        = CHZM_LIVE_OK|TICKS:290|MAX_JITTER_MS:154.70|HASH:MATCH|MB:64 - Google Chrome
+  wake_latency_ms     = 1.61
+  restore_settings_ms = 0.20 (priority+quota)
+  prefetch_ms         = 0.03
+  dma_probe_ms        = 1.22
+  ping100 p50=0.021 p95=0.048 p99=0.060 max=0.063 ms
+  window_title        = CHZM_LIVE_OK|TICKS:299|MAX_JITTER_MS:14.40|HASH:MATCH|MB:64 - Google Chrome
   js_hash_verification= MATCH
   priorities_restored = YES (worst=0)
 
@@ -73,16 +75,16 @@ generated=2026-11-05 18:23:07
 
 [SUMMARY]
   metric                          stock      autopilot   aggressive
-  tick p95 ms                         0.46       0.46       0.46
-  tick p99 ms                         0.47       0.50       0.47
-  tick max ms                         0.58       0.64       0.53
-  ping p95 ms                         0.39       0.11       0.04
-  ping max ms                         0.75       0.83       0.72
-  avail RAM delta MB                   271        -18         74
+  tick p95 ms                         0.50       0.50       0.51
+  tick p99 ms                         0.51       0.51       0.53
+  tick max ms                         0.51       0.52       0.57
+  ping p95 ms                         0.46       0.39       0.56
+  ping max ms                         0.91       0.49       0.68
+  avail RAM delta MB                     7          4         -7
 
 RESULT: PASS
-  trimmed_ws_sum_mb       = 214
-  trimmed_private_ws_sum_mb = 204
+  trimmed_ws_sum_mb       = 727
+  trimmed_private_ws_sum_mb = 355
   crashed_chrome_processes = 0
   js_hash_verification     = MATCH
   live_crash_recovery      = PASS

@@ -378,7 +378,10 @@ bool ResumeByHandle(HANDLE process)
 
 bool UnparkProcess(HANDLE process)
 {
-    SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0);
+    // (-1,-1) = EmptyWorkingSet, not a quota reset. Real bounds.
+    SetProcessWorkingSetSizeEx(process, 1024ull * 1024ull, 4096ull * 1024ull * 1024ull,
+                                   QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+                                       QUOTA_LIMITS_HARDWS_MAX_DISABLE);
     PROCESS_POWER_THROTTLING_STATE state{};
     state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
     state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
@@ -576,21 +579,35 @@ int RunFreezeVictim(DWORD victimPid, const std::wstring& dataDir)
 
 int RunReleaseAll()
 {
-    // Every process in the system, not just the ones we trimmed: older builds
-    // could have left EcoQoS on Chrome/Telegram, and that clamps the CPU to
-    // ~500 MHz and kills YouTube scroll.
     struct Target {
         const wchar_t* name;
         int total = 0;
         int released = 0;
+        int hadHardMax = 0;
+        SIZE_T worstOldMaxMb = 0;
     } targets[] = {
-        { L"chrome.exe", 0, 0 },
-        { L"telegram.exe", 0, 0 },
-        { L"discord.exe", 0, 0 },
+        { L"chrome.exe", 0, 0, 0, 0 },
+        { L"telegram.exe", 0, 0, 0, 0 },
+        { L"discord.exe", 0, 0, 0, 0 },
+    };
+
+    FILE* log = _wfsopen((LocalAppData() + L"\\release_all.log").c_str(),
+                         L"w, ccs=UTF-8", _SH_DENYNO);
+    auto WriteLog = [&](const wchar_t* format, ...) {
+        if (!log) return;
+        va_list args;
+        va_start(args, format);
+        vfwprintf(log, format, args);
+        va_end(args);
+        fwprintf(log, L"\n");
+        fflush(log);
     };
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return 2;
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        if (log) fclose(log);
+        return 2;
+    }
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
@@ -609,12 +626,24 @@ int RunReleaseAll()
                                          FALSE, pid);
             if (!process) continue;
 
+            SIZE_T oldMin = 0, oldMax = 0;
+            DWORD oldFlags = 0;
+            GetProcessWorkingSetSizeEx(process, &oldMin, &oldMax, &oldFlags);
+
             bool ok = true;
-            if (!SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1,
+            // Real bounds + disable bits. (-1,-1) is EmptyWorkingSet, not a reset.
+            if (!SetProcessWorkingSetSizeEx(process, 1024ull * 1024ull,
+                                            4096ull * 1024ull * 1024ull,
                                             QUOTA_LIMITS_HARDWS_MIN_DISABLE |
                                                 QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
                 ok = false;
             }
+
+            SIZE_T newMin = 0, newMax = 0;
+            DWORD newFlags = 0;
+            GetProcessWorkingSetSizeEx(process, &newMin, &newMax, &newFlags);
+            const bool hardMaxGone =
+                (newFlags & QUOTA_LIMITS_HARDWS_MAX_ENABLE) == 0;
 
             PROCESS_POWER_THROTTLING_STATE throttling{};
             throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
@@ -628,39 +657,50 @@ int RunReleaseAll()
             struct PriorityInfo { ULONG MemoryPriority; } priority{ 5 };
             SetProcessInformation(process, ProcessMemoryPriority, &priority,
                                   sizeof(priority));
-
             SetPriorityClass(process, NORMAL_PRIORITY_CLASS);
 
             std::wstring name = entry.szExeFile;
             for (wchar_t& c : name) c = (wchar_t)towlower(c);
+
             for (Target& target : targets) {
                 if (name == target.name) {
                     ++target.total;
-                    if (ok) ++target.released;
+                    if ((oldFlags & QUOTA_LIMITS_HARDWS_MAX_ENABLE) != 0) {
+                        ++target.hadHardMax;
+                    }
+                    if (oldMax / (1024ull * 1024ull) > target.worstOldMaxMb) {
+                        target.worstOldMaxMb = (SIZE_T)(oldMax / (1024ull * 1024ull));
+                    }
+                    if (ok && hardMaxGone) ++target.released;
+                    WriteLog(L"  %-14ls pid=%lu ws_max %llu->%llu MB flags 0x%lx->0x%lx %ls",
+                             name.c_str(), (unsigned long)pid,
+                             (unsigned long long)(oldMax / (1024ull * 1024ull)),
+                             (unsigned long long)(newMax / (1024ull * 1024ull)),
+                             (unsigned long)oldFlags, (unsigned long)newFlags,
+                             hardMaxGone ? L"HARDMAX_RELEASED" : L"STILL_CLAMPED");
                 }
             }
 
-            if (ok) ++released;
+            if (ok && hardMaxGone) ++released;
             CloseHandle(process);
         } while (Process32NextW(snapshot, &entry));
     }
     CloseHandle(snapshot);
 
-    FILE* log = _wfsopen((LocalAppData() + L"\\release_all.log").c_str(),
-                         L"a, ccs=UTF-8", _SH_DENYNO);
-    if (log) {
-        SYSTEMTIME now{};
-        GetLocalTime(&now);
-        fwprintf(log, L"[%02u:%02u:%02u] release-all: scanned=%d released=%d",
-                 now.wHour, now.wMinute, now.wSecond, scanned, released);
-        for (const Target& target : targets) {
-            fwprintf(log, L" | %ls %d/%d", target.name, target.released, target.total);
-        }
-        fwprintf(log, L"\n");
-        fclose(log);
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    WriteLog(L"[%02u:%02u:%02u] release-all: scanned=%d released=%d",
+             now.wHour, now.wMinute, now.wSecond, scanned, released);
+    for (const Target& target : targets) {
+        WriteLog(L"  %-14ls %d/%d released, %d had HARDWS_MAX_ENABLE, worst oldMax %llu MB",
+                 target.name, target.released, target.total, target.hadHardMax,
+                 (unsigned long long)target.worstOldMaxMb);
     }
+    if (log) fclose(log);
     return released > 0 ? 0 : 1;
 }
+
+
 
 
 
@@ -1210,9 +1250,12 @@ int RunLiveCombat(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
     double wakeRestore = 0.0;
     const int woken = cryo.WakePids(aliveAfterTrim, wakeRestore);
     const double wakeLatency = wakeTimer.Ms();
+    const LiveMetrics wakeMetrics = cryo.LastLiveMetrics();
     Both(L"  woken_processes     = %d", woken);
     Both(L"  wake_latency_ms     = %.2f", wakeLatency);
-    Both(L"  restore_settings_ms = %.2f", wakeRestore);
+    Both(L"  restore_settings_ms = %.2f (priority+quota)", wakeMetrics.restorePriorityQuotasMs);
+    Both(L"  prefetch_ms         = %.2f", wakeMetrics.prefetchMs);
+    Both(L"  dma_probe_ms        = %.2f", wakeMetrics.dmaProbeMs);
 
     std::vector<double> quickPings;
     for (int i = 0; i < 100; ++i) {

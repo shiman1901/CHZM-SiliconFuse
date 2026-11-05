@@ -147,6 +147,9 @@ struct LiveMetrics {
     uint64_t gddr6SnapshotBytes = 0;
     uint64_t hardFaultDelta = 0;
     double restoreSettingsMs = 0.0;
+    double restorePriorityQuotasMs = 0.0;
+    double prefetchMs = 0.0;
+    double dmaProbeMs = 0.0;
     uint64_t elapsedMs = 0;
     int processes = 0;
 };

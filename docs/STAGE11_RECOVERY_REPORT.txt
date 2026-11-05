@@ -1,9 +1,9 @@
 ﻿CHZM//SILICONFUSE  STAGE 11  RECOVERY REPORT
-generated=2026-11-05 17:54:14
+generated=2026-11-05 18:42:53
 mode=torture (chaos engineering)
 
 [TEST 1: BUILD + EMBEDDED ICON]
-  exe_size_bytes  = 1144840
+  exe_size_bytes  = 1153524
   rt_group_icon   = PRESENT (id 1)
   mirror_flags    = FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
   mirror_capacity = 4096 MB
@@ -14,10 +14,10 @@ mode=torture (chaos engineering)
   adapter_vram_mb = 11964
   pool_mb         = 4096
   slices          = 4 x 1024 MB
-  commit_free_mb  = 21374 (floor 6144)
+  commit_free_mb  = 20518 (floor 6144)
   mirror_durable  = 1
-  avx2_vram_write_mbps = 10862.4 (5.89 ms / 64 MB)
-  avx2_hash_ms_64mb = 1.83 (34.1 GB/s, hash=6451794913016362337)
+  avx2_vram_write_mbps = 10843.4 (5.90 ms / 64 MB)
+  avx2_hash_ms_64mb = 1.79 (35.0 GB/s, hash=6451794913016362337)
 
 [CHAOS 1: UNBUFFERED NVME MIRROR & ZERO CACHE LEAK (512 MB)]
   frozen            = 1
@@ -25,11 +25,11 @@ mode=torture (chaos engineering)
   mirror_bytes_mb   = 512
   write_io_delta_mb = 512 (>= 512 required)
   reopen_mirror     = 1
-  vram_evicted      = 1 (84.10 ms)
+  vram_evicted      = 1 (82.87 ms)
   read_io_delta_mb  = 512 (>= 512 required)
-  avail_ram_before  = 9867 MB
-  avail_ram_after   = 10331 MB
-  avail_ram_delta   = 464 MB (cache must not eat the win)
+  avail_ram_before  = 9018 MB
+  avail_ram_after   = 9495 MB
+  avail_ram_delta   = 477 MB (cache must not eat the win)
   restored          = 1 (mirror regions 13)
   checksum          = MATCH
   bit_match         = 100.0000%
@@ -41,7 +41,7 @@ mode=torture (chaos engineering)
   mirror_regions    = 13
   mirror_bytes_mb   = 256
   checksum          = MATCH
-  total_ms          = 260.82
+  total_ms          = 190.92
   bit_match         = 100.0000%
 
 [CHAOS 3A: VRAM BIT-FLIP SELF-HEALING (128 MB)]
@@ -70,7 +70,7 @@ mode=torture (chaos engineering)
   victim_intact     = 100.0000%
 
 [TEST 9: VRAM EVICTION SURVIVAL (REGRESSION)]
-  evicted_ms = 64.67 | mirror_regions = 13 | checksum = MATCH
+  evicted_ms = 62.36 | mirror_regions = 13 | checksum = MATCH
   restored = 1 | bit_match = 100.0000%
 
 [TEST 10: EXIT SAFETY (RestoreAllFrozen)]
@@ -91,11 +91,11 @@ mode=torture (chaos engineering)
   verdict           = REFUSED (creation time mismatch, process untouched)
 
 [SENSORS]
-  nvml_fb_used_mb   = 4331 / 11964
+  nvml_fb_used_mb   = 4430 / 11964
   nvml_bar1_used_mb = 16355 / 16384
   mirror_bytes_used = 512 MB
   mirror_durable    = 1
   pool_end_mb       = 4096
-  free_commit_end_mb= 22362
+  free_commit_end_mb= 21532
 
 RESULT: STAGE 11 RECOVERY FINISHED
