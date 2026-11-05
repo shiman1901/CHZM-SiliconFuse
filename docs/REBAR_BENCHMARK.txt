@@ -1,0 +1,56 @@
+======================================================================
+CHZM-SiliconFuse ReBAR Direct Silicon Benchmark v0.1
+======================================================================
+Adapter            : NVIDIA GeForce RTX 3060
+Adapter LUID       : 00000000:0000F52E
+Vendor / Device    : 0x10DE / 0x2504
+Dedicated VRAM     : 11964 MB
+Aperture Target    : 0x00000078_00000000 (BAR1, 16384 MB, firmware map)
+D3D12 Architecture : UMA=0 CacheCoherentUMA=0
+AVX2               : yes
+----------------------------------------------------------------------
+[DIRECT MMIO] D3D12 CUSTOM + WRITE_COMBINE + L1: ACCEPTED
+  Buffer           : 64 MB L1 allocation, CPU pointer via PCIe
+  Sequential Write :  10866.1 MB/s (AVX2 NT stores + sfence)
+  Sequential Read  :     37.4 MB/s (AVX2 loads, uncached)
+  Sequential Read NT:   250.6 MB/s (MOVNTDQA)
+  Access Latency   :    939.5 ns per 64-bit read
+  Random 4K Write  :  2797359 IOPS | 0.4 us | 10927.2 MB/s
+  Random 4K Read   :     9571 IOPS | 104.5 us | 37.4 MB/s
+  Random 64K Write :   173824 IOPS | 5.8 us | 10864.0 MB/s
+  Random 64K Read  :      595 IOPS | 1679.7 us | 37.2 MB/s
+  Integrity        : PASS (checksum 0xA22AD33B_C3C00000)
+  GPU-verified     : PASS (copy engine readback, 64 MB)
+----------------------------------------------------------------------
+[DMA] Copy engine over PCIe (supported WDDM path)
+Allocation Size    : 1024 MB pure GDDR6 (D3D12 L1 / DEFAULT heap)
+Sequential Write   :  12201.5 MB/s (Host -> VRAM, PCIe write)
+Sequential Read    :  12567.1 MB/s (VRAM -> Host, PCIe read)
+Random 4K Write    :  2451221 IOPS | Avg Latency: 0.4 us
+Random 4K Read     :   640000 IOPS | Avg Latency: 1.6 us
+Random 64K Write   :  26067.7 MB/s |   417084 IOPS | 2.4 us
+Random 64K Read    :   9388.2 MB/s |   150212 IOPS | 6.7 us
+CPU staging fill   :  28184.8 MB/s (AVX2 NT stores, L0 WC RAM)
+CPU staging read   :  29916.3 MB/s (AVX2 loads, L0 readback RAM)
+Integrity          : PASS (checksum 0x77E59F5D_5EC00000)
+----------------------------------------------------------------------
+Allocation Size    : 2048 MB pure GDDR6 (D3D12 L1 / DEFAULT heap)
+Sequential Write   :  12207.9 MB/s (Host -> VRAM, PCIe write)
+Sequential Read    :  12580.3 MB/s (VRAM -> Host, PCIe read)
+Random 4K Write    :  2116268 IOPS | Avg Latency: 0.5 us
+Random 4K Read     :   607500 IOPS | Avg Latency: 1.6 us
+Random 64K Write   :  25503.4 MB/s |   408055 IOPS | 2.5 us
+Random 64K Read    :   9244.2 MB/s |   147908 IOPS | 6.8 us
+CPU staging fill   :  28337.7 MB/s (AVX2 NT stores, L0 WC RAM)
+CPU staging read   :  29761.9 MB/s (AVX2 loads, L0 readback RAM)
+Integrity          : PASS (checksum 0x77E59F5D_5EC00000)
+----------------------------------------------------------------------
+[COMPARE] ImDisk Proxy (Old)  : 5103.8 MB/s | 109020 IOPS (36.2 us)
+[COMPARE] ReBAR MMIO  (New) : 10866.1 MB/s | 9571 IOPS (104.5 us)
+[COMPARE] Ratio               : 2.13x sequential | 0.09x 4K IOPS | 0.35x latency
+======================================================================
+Reading the result: direct MMIO writes are bandwidth-bound and reach
+PCIe line rate; MMIO reads are latency-bound (one transaction per
+access) and lose to the copy engine. Correct policy is WC writes via
+BAR1 and DMA for reads. The ImDisk reference was a user-mode block
+proxy, so ratios are indicative, not an apples-to-apples transport test.

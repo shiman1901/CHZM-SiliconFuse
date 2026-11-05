@@ -1,0 +1,32 @@
+# ---- Build output (binaries never go to git) ----
+build/
+build/*.exe
+build/*.o
+build/*.obj
+build/*.pdb
+build/*.ilk
+build/*.log
+
+# ---- Compiled / binary artifacts ----
+*.exe
+*.dll
+*.o
+*.obj
+*.bin
+*.sys
+*.pdb
+*.ilk
+
+# ---- Logs & temp ----
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# ---- Toolchain / IDE ----
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini

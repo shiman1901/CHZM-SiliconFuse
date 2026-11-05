@@ -1,0 +1,72 @@
+======================================================================
+CHZM-SiliconFuse WDDM Lease Arbitration Report
+======================================================================
+Test date          : 05.11.2026  2:41:01,55
+Broker pool request: 4096 MB in 4 x 1024 MB slices
+Dirty working set  : 512 MB per slice
+Pressure request   : 8192 MB commit, 8192 MB touched, 5 s
+Safety interlock    : abort if GPU utilization > 40% (median) at start
+----------------------------------------------------------------------
+[BROKER LOG]
+NVML               : available (secondary pressure signal)
+======================================================================
+CHZM-SiliconFuse Chunked Lease Broker v0.2
+======================================================================
+Start wall clock   : 02:40:03.016
+Budget at start    : 11196 MB
+Usage  at start    : 8 MB
+Host RAM available : 11995 MB
+Target pool        : 4096 MB in 1024 MB slices
+Allocated pool     : 4096 MB in 4 slices
+[FILL] 4 slices, 2048 MB dirty, 5.09 GB/s aggregate (AVX2 NT stores)
+Dirty working set  : 2048 MB total (512 MB per slice)
+Budget notification: registered (cookie 1)
+----------------------------------------------------------------------
+[02:40:04.382] [MONITOR] budget=11196 MB usage=4104 MB resident=4096 MB
+[02:40:04.382] [MONITOR] nvml free=6920 MB total=12288 MB
+[02:40:06.591] [SIGNAL] usage=4104 MB budget=11196 MB nvml_free=4866 MB baseline=6920 MB deficit=2053 MB reaction=111.28 ms [nvml]
+[02:40:06.591] [STATE] EVICTING deficit=2053 MB (nvml)
+[EVICT] slice=0 copy=202.09 ms evict=0.01 ms release=371.67 ms total=690.63 ms freed=1024 MB remaining=3072 MB
+[EVICT] slice=1 copy=91.07 ms evict=0.01 ms release=13.15 ms total=104.26 ms freed=1024 MB remaining=2048 MB
+[EVICT] slice=2 copy=114.81 ms evict=0.02 ms release=15.97 ms total=130.82 ms freed=1024 MB remaining=1024 MB
+[02:40:07.506] [EVICT-DONE] slices=3 freed=3072 MB total=925.70 ms resident=1024 MB
+[02:40:08.049] [SIGNAL] usage=1032 MB budget=11196 MB nvml_free=5907 MB baseline=6920 MB deficit=1012 MB reaction=111.31 ms [nvml]
+[02:40:08.049] [STATE] EVICTING deficit=1012 MB (nvml)
+[EVICT] slice=3 copy=117.76 ms evict=0.02 ms release=12.48 ms total=130.30 ms freed=1024 MB remaining=0 MB
+[02:40:08.180] [EVICT-DONE] slices=1 freed=1024 MB total=130.30 ms resident=0 MB
+[02:40:12.548] [SIGNAL] recovered budget=11196 MB nvml_free=11036 MB
+[02:40:12.548] [STATE] RESTORING 4 slice(s)
+[RESTORE] slice=0 total=120.86 ms resident=1024 MB
+[RESTORE] slice=1 total=138.23 ms resident=2048 MB
+[RESTORE] slice=2 total=106.58 ms resident=3072 MB
+[RESTORE] slice=3 total=106.69 ms resident=4096 MB
+[02:40:13.015] [RESTORE-DONE] total=472.35 ms resident=4096 MB
+----------------------------------------------------------------------
+SUMMARY
+  Slices total     : 4
+  Pool bytes       : 4096 MB
+  Resident at exit : 4096 MB
+  Eviction rounds  : 2
+  Slices evicted   : 4
+  Slices restored  : 4
+  Final budget     : 11196 MB
+  Final usage      : 4104 MB
+  End wall clock   : 02:40:59.398
+----------------------------------------------------------------------
+[PRESSURE LOG]
+======================================================================
+CHZM-SiliconFuse GPU Pressure Emulator v0.1
+======================================================================
+[02:40:06.501] Start wall clock : 02:40:06.501
+[02:40:06.501] Requested commit : 8192 MB
+[02:40:06.501] Budget (LOCAL)   : 11196 MB
+[02:40:06.501] Usage  (LOCAL)   : 8 MB
+[02:40:07.269] Commit result    : OK (8192 MB)
+[02:40:07.269] Touch window     : 8192 MB of 8192 MB
+[02:40:12.272] Pressure done    : 5.00 s, 7645 batches, 59.73 GB written
+[02:40:12.272] Write throughput : 11.94 GB/s
+[02:40:12.272] Budget (LOCAL)   : 11196 MB
+[02:40:12.272] Usage  (LOCAL)   : 8200 MB
+[02:40:12.272] VERDICT          : PRESSURE APPLIED
+----------------------------------------------------------------------
+[END OF REPORT]

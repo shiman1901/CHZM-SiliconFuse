@@ -1,0 +1,48 @@
+#pragma once
+
+#include <windows.h>
+#include <shellapi.h>
+
+#include <string>
+
+class VramPool;
+
+class MainWindow {
+public:
+    MainWindow();
+    ~MainWindow();
+
+    bool Create(HINSTANCE instance, VramPool* pool, const std::wstring& exePath);
+    void Show(int cmdShow);
+    HWND Handle() const { return hwnd_; }
+
+private:
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    LRESULT Dispatch(UINT msg, WPARAM wParam, LPARAM lParam);
+
+    void EnableGlass();
+    void Paint();
+    void DrawScene(HDC dc, int width, int height);
+    void OnTimer();
+    void TogglePower();
+    void ToggleAutostart();
+    bool AutostartEnabled() const;
+    void AddTrayIcon();
+    void RemoveTrayIcon();
+
+    HINSTANCE instance_ = nullptr;
+    HWND hwnd_ = nullptr;
+    VramPool* pool_ = nullptr;
+    std::wstring exePath_;
+
+    HFONT fontTitle_ = nullptr;
+    HFONT fontLabel_ = nullptr;
+    HFONT fontMono_ = nullptr;
+
+    bool autostart_ = false;
+    bool trayAdded_ = false;
+
+    RECT capsuleRect_{};
+    RECT minimizeRect_{};
+    RECT autostartRect_{};
+};

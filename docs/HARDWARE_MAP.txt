@@ -1,0 +1,56 @@
+======================================================================
+CHZM-SiliconFuse Hardware Silicon Mapper v0.1
+======================================================================
+[CPU] System RAM Installed   : 16384 MB (DDR4-3800)
+[GPU] Device Identified       : NVIDIA GeForce RTX 3060 (PCIe 09:00.0)
+[BAR] Resizable BAR Status   : ACTIVE (Full Framebuffer Exposed)
+[BAR] Physical Base Address  : 0x00000078_00000000
+[BAR] Memory Window Size     : 16384 MB (16.00 GB)
+[BAR] Framebuffer Mapped     : 12288 MB (12.00 GB)
+[MAP] Unified Memory Target  : 28672 MB (28.00 GB Hardware Fabric)
+======================================================================
+NOTE: 28 GB is a unified physical address window, not a single DRAM
+      device. Residency and placement are enforced by the SiliconFuse
+      policy engine; the probe performs read-only topology discovery.
+----------------------------------------------------------------------
+
+[SYSTEM]
+Processor                     : AMD Ryzen 7 5700X 8-Core Processor             
+Installed RAM (firmware)      : 16384 MB
+Usable RAM (OS)               : 16293 MB
+Memory Load                   : 64 %
+SMBIOS Memory Type            : DDR4
+SMBIOS Rated Speed            : 3800 MT/s
+Populated Modules             : 2
+
+[ADAPTER]
+Friendly Name                 : NVIDIA GeForce RTX 3060
+Device Description            : NVIDIA GeForce RTX 3060
+Instance Path                 : PCI\VEN_10DE&DEV_2504&SUBSYS_39771462&REV_A1\4&1FC990D7&0&0019
+PCI Identifiers               : VEN_10DE DEV_2504 SUBSYS_00003977 REV_A1
+Driver Version                : 32.0.16.1742
+Framebuffer (registry)        : 12288 MB
+Resource Source               : Enum\...\LogConf\BootConfig (firmware)
+CM_Get_Alloc_Log_Conf         : 19 (CR_FAILURE - CM query unavailable, firmware config used)
+
+[MEMORY WINDOWS] (allocated logical configuration)
+  BASE                SIZE (MB)    FLAGS    ROLE
+  0x00000000_F5000000 16           -B-      BAR0 register block
+  0x00000078_00000000 16384        PBL      BAR1 framebuffer aperture
+  0x0000007C_00000000 32           PB-      auxiliary BAR / MMIO
+  flags: P=prefetchable B=PCI BAR L=large-memory descriptor
+
+[RESIZABLE BAR VALIDATION]
+Framebuffer Size              : 12288 MB
+Aperture Size                 : 16384 MB
+Aperture / Framebuffer        : 16.00 / 12.00 GB
+Power-of-two aperture         : yes (12 GB rounds up to 16 GB)
+Verdict                       : PASS - full framebuffer is CPU-visible
+
+[TIER PROJECTION]
+Tier 0 (DDR4)                 : 16384 MB
+Tier 1 (GDDR6 via ReBAR)      : 12288 MB
+Tier 2 (NVMe spillover)       : policy-defined
+Unified Target                : 28672 MB
+----------------------------------------------------------------------
+Probe complete. No hardware state was modified.
