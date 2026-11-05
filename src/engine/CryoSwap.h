@@ -125,6 +125,8 @@ struct TrimmedProcess {
     uint64_t faultsBefore = 0;
     uint64_t faultsAfter = 0;
     int64_t systemDelta = 0;
+    bool protectedRole = false;
+    HANDLE handle = nullptr;   // cached for a fast wake
     uint32_t priorityBefore = 5;
     uint32_t priorityApplied = 5;
     ULONGLONG trimmedAt = 0;

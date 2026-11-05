@@ -576,34 +576,93 @@ int RunFreezeVictim(DWORD victimPid, const std::wstring& dataDir)
 
 int RunReleaseAll()
 {
-    std::vector<DWORD> pids(4096);
-    DWORD needed = 0;
-    if (!EnumProcesses(pids.data(), (DWORD)(pids.size() * sizeof(DWORD)), &needed)) return 2;
-    size_t count = needed / sizeof(DWORD);
-    if (count > pids.size()) count = pids.size();
+    // Every process in the system, not just the ones we trimmed: older builds
+    // could have left EcoQoS on Chrome/Telegram, and that clamps the CPU to
+    // ~500 MHz and kills YouTube scroll.
+    struct Target {
+        const wchar_t* name;
+        int total = 0;
+        int released = 0;
+    } targets[] = {
+        { L"chrome.exe", 0, 0 },
+        { L"telegram.exe", 0, 0 },
+        { L"discord.exe", 0, 0 },
+    };
 
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return 2;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
     const DWORD self = GetCurrentProcessId();
+
+    int scanned = 0;
     int released = 0;
-    for (size_t i = 0; i < count; ++i) {
-        const DWORD pid = pids[i];
-        if (!pid || pid == 4 || pid == self) continue;
-        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
-                                         PROCESS_SET_INFORMATION,
-                                     FALSE, pid);
-        if (!process) continue;
-        if (SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1, 0)) ++released;
-        PROCESS_POWER_THROTTLING_STATE state{};
-        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-        state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-        state.StateMask = 0;
-        SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
-        struct PriorityInfo { ULONG MemoryPriority; } priority{ 5 };
-        SetProcessInformation(process, ProcessMemoryPriority, &priority,
-                              sizeof(priority));
-        CloseHandle(process);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            const DWORD pid = entry.th32ProcessID;
+            if (!pid || pid == 4 || pid == self) continue;
+            ++scanned;
+
+            HANDLE process = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA |
+                                             PROCESS_QUERY_LIMITED_INFORMATION,
+                                         FALSE, pid);
+            if (!process) continue;
+
+            bool ok = true;
+            if (!SetProcessWorkingSetSizeEx(process, (SIZE_T)-1, (SIZE_T)-1,
+                                            QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+                                                QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+                ok = false;
+            }
+
+            PROCESS_POWER_THROTTLING_STATE throttling{};
+            throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            throttling.StateMask = 0;
+            if (!SetProcessInformation(process, ProcessPowerThrottling, &throttling,
+                                       sizeof(throttling))) {
+                ok = false;
+            }
+
+            struct PriorityInfo { ULONG MemoryPriority; } priority{ 5 };
+            SetProcessInformation(process, ProcessMemoryPriority, &priority,
+                                  sizeof(priority));
+
+            SetPriorityClass(process, NORMAL_PRIORITY_CLASS);
+
+            std::wstring name = entry.szExeFile;
+            for (wchar_t& c : name) c = (wchar_t)towlower(c);
+            for (Target& target : targets) {
+                if (name == target.name) {
+                    ++target.total;
+                    if (ok) ++target.released;
+                }
+            }
+
+            if (ok) ++released;
+            CloseHandle(process);
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+
+    FILE* log = _wfsopen((LocalAppData() + L"\\release_all.log").c_str(),
+                         L"a, ccs=UTF-8", _SH_DENYNO);
+    if (log) {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        fwprintf(log, L"[%02u:%02u:%02u] release-all: scanned=%d released=%d",
+                 now.wHour, now.wMinute, now.wSecond, scanned, released);
+        for (const Target& target : targets) {
+            fwprintf(log, L" | %ls %d/%d", target.name, target.released, target.total);
+        }
+        fwprintf(log, L"\n");
+        fclose(log);
     }
     return released > 0 ? 0 : 1;
 }
+
+
 
 // Live-mode killable worker for the crash-recovery test.
 int RunTrimVictim(DWORD victimPid, const std::wstring& dataDir)
@@ -1076,7 +1135,7 @@ int RunLiveCombat(VramPool& pool, CryoSwap& cryo, StorageBridge& bridge,
     }
     const LiveMetrics safeMetrics = cryo.LastLiveMetrics();
     Both(L"  processes      = %d", safeCount);
-    Both(L"  priority map   = 5 -> 2 (LOW), EcoQoS ON");
+    Both(L"  priority map   = 5 -> 2 (LOW), EcoQoS = DISABLED BY DESIGN");
     Both(L"  ws_sum_mb      = %llu", (unsigned long long)(safeMetrics.trimmedWsSum / kMb));
     Both(L"  priv_sum_mb    = %llu",
          (unsigned long long)(safeMetrics.trimmedPrivateWsSum / kMb));

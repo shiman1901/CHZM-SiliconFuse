@@ -1,4 +1,4 @@
-#include <initguid.h>
+﻿#include <initguid.h>
 
 #include "CryoSwap.h"
 
@@ -48,7 +48,7 @@ constexpr SIZE_T kQuotaMax = 24ull * kMb;
 constexpr SIZE_T kLiveQuotaMin = 4ull * kMb;
 constexpr SIZE_T kLiveQuotaMax = 32ull * kMb;
 constexpr uint64_t kLiveMinWorkingSet = 50ull * kMb;
-constexpr uint64_t kLiveHotBytes = 48ull * kMb;
+constexpr uint64_t kLiveHotBytes = 12ull * kMb;
 constexpr int kMaxTrimPerCycle = 32;
 constexpr float kAudioPeak = 0.0005f;
 
@@ -979,6 +979,40 @@ bool WriteMemoryPriority(HANDLE process, uint32_t value)
 
 } // namespace
 
+
+namespace {
+
+// ProcessCommandLineInformation = 60 (Win 8.1+). Used only to detect the role
+// of Chromium child processes: gpu-process / utility (audio) / crashpad.
+std::wstring ProcessCommandLine(HANDLE process)
+{
+    struct UnicodeStringLocal {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR Buffer;
+    };
+
+    typedef LONG(NTAPI* PfnNtQueryInformationProcess)(HANDLE, ULONG, void*, ULONG,
+                                                      ULONG*);
+    static PfnNtQueryInformationProcess fn =
+        reinterpret_cast<PfnNtQueryInformationProcess>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                           "NtQueryInformationProcess")));
+    if (!fn) return std::wstring();
+
+    ULONG size = 0;
+    fn(process, 60, nullptr, 0, &size);
+    if (size == 0 || size > 64 * 1024) return std::wstring();
+
+    std::vector<uint8_t> buffer(size);
+    if (fn(process, 60, buffer.data(), size, &size) != 0) return std::wstring();
+    auto* text = reinterpret_cast<UnicodeStringLocal*>(buffer.data());
+    if (!text->Buffer || text->Length == 0) return std::wstring();
+    return std::wstring(text->Buffer, text->Length / sizeof(wchar_t));
+}
+
+} // namespace
+
 bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE process,
                                LiveTrimMode mode, TrimmedProcess& out)
 {
@@ -1000,7 +1034,8 @@ bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE proce
                                 : kMemoryPriorityLow;
     WriteMemoryPriority(process, target);
     out.priorityApplied = target;
-    ApplyEcoQos(process, true);
+    // EcoQoS is intentionally NOT applied here: CPU frequency
+    // throttling is what makes YouTube and Telegram stutter.
 
     // Step 2: non-destructive hot snapshot into GDDR6 (transport probe).
     const std::vector<WIN32_MEMORY_RANGE_ENTRY> hot =
@@ -1034,11 +1069,19 @@ bool CryoSwap::TrimProcessLive(DWORD pid, const std::wstring& name, HANDLE proce
     }
     out.bytes = copied;
 
-    // Step 3: reclaim only on demand, and never with a hard working-set lock.
-    // EmptyWorkingSet pushes cold pages to the (now low priority) standby list,
-    // active JS timers keep their hot 15-30 MB without thrashing.
+    // Step 3: reclaim only on demand, never with a hard working-set lock, and
+    // never on the GPU compositor, audio utility or messenger UI: trimming
+    // those produces stutter instead of free memory.
+    const std::wstring commandLine = ProcessCommandLine(process);
+    const bool protectedRole =
+        commandLine.find(L"--type=gpu-process") != std::wstring::npos ||
+        commandLine.find(L"--type=utility") != std::wstring::npos ||
+        commandLine.find(L"--type=crashpad-handler") != std::wstring::npos ||
+        name == L"telegram.exe" || name == L"discord.exe";
+    out.protectedRole = protectedRole;
+
     int64_t systemDelta = 0;
-    if (mode == LiveTrimMode::AggressiveReclaim) {
+    if (mode == LiveTrimMode::AggressiveReclaim && !protectedRole) {
         const uint64_t availBefore = AvailablePhysicalMb();
         EmptyWorkingSet(process);
         const uint64_t availAfter = AvailablePhysicalMb();
@@ -1085,6 +1128,7 @@ int CryoSwap::TrimPids(const std::vector<DWORD>& pids, LiveTrimMode mode)
         const std::wstring name = BaseName(process);
         TrimmedProcess trimmed;
         if (TrimProcessLive(pid, name, process, mode, trimmed)) {
+            trimmed.handle = process; // owned by the trimmed list
             ++count;
             if (trimmed.wsBefore > trimmed.wsAfter) {
                 metrics.trimmedWsSum += trimmed.wsBefore - trimmed.wsAfter;
@@ -1100,6 +1144,7 @@ int CryoSwap::TrimPids(const std::vector<DWORD>& pids, LiveTrimMode mode)
             }
             std::lock_guard<std::mutex> lock(trimmedMutex_);
             trimmed_.push_back(std::move(trimmed));
+            continue;
         }
         CloseHandle(process);
     }
@@ -1238,12 +1283,17 @@ int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs
     Timer settingsTimer;
     settingsTimer.Begin();
     for (const TrimmedProcess& entry : group) {
-        HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
-                                     PROCESS_SET_INFORMATION,
-                                 FALSE, entry.pid);
+        HANDLE process = entry.handle;
+        bool owned = false;
+        if (!process) {
+            process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION |
+                                      PROCESS_SET_INFORMATION,
+                                  FALSE, entry.pid);
+            owned = true;
+        }
         if (!process) continue;
         RestoreLiveSettings(process);
-        CloseHandle(process);
+        if (owned) CloseHandle(process);
     }
     restoreSettingsMs = settingsTimer.Ms();
 
@@ -1261,6 +1311,7 @@ int CryoSwap::WakePids(const std::vector<DWORD>& pids, double& restoreSettingsMs
             }
             CloseHandle(process);
         }
+        if (entry.handle) CloseHandle(entry.handle);
         if (staging.data && !entry.chunks.empty()) {
             double mbps = 0.0;
             const CachedChunk& probe = entry.chunks.front();
