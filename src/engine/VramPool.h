@@ -32,6 +32,12 @@ struct PoolStats {
 
     bool busy = false;
     bool evacuated = false;
+
+    // Adaptive sizing: target chosen at startup (or by the UI) and the
+    // adapter capacity it was derived from.
+    uint32_t targetMb = 0;
+    uint32_t autoTargetMb = 0;
+    uint64_t adapterVramBytes = 0;
 };
 
 // 4 x 1 GB Tier-1 pool in GDDR6. Each slice is an independent D3D12
@@ -41,9 +47,17 @@ public:
     VramPool();
     ~VramPool();
 
+    // targetMb == 0 selects the automatic size for the detected adapter.
     bool Init(StorageBridge* bridge, uint32_t targetMb, uint32_t sliceMb,
               const std::wstring& logPath);
     void Shutdown();
+
+    // Adaptive sizing. The monitor thread owns the slice vector; the UI only
+    // posts an intent and reads stats.
+    uint64_t AdapterVramBytes() const { return adapterVramBytes_; }
+    uint32_t AutoTargetMb() const { return autoTargetMb_; }
+    uint32_t TargetMb() const { return targetMb_.load(); }
+    void RequestResize(uint32_t targetMb);
 
     bool StartMonitor();
     void StopMonitor();
@@ -64,6 +78,7 @@ private:
     bool SubmitAndWait();
     bool AllocateSlices(uint64_t targetBytes, uint64_t sliceBytes);
     bool AddSlice(uint64_t bytes);
+    bool ResizeTo(uint32_t targetMb);
     bool PrepareStaging(uint64_t bytes);
 
     bool EvictSlice(size_t index, double& totalMs);
@@ -120,12 +135,17 @@ private:
     uint64_t totalBytes_ = 0;
     uint64_t dirtyTotal_ = 0;
     uint64_t sliceBytes_ = 0;
+    uint64_t adapterVramBytes_ = 0;
+    uint32_t autoTargetMb_ = 0;
     double lastDmaMBps_ = 0.0;
 
     std::thread monitor_;
     std::atomic<bool> stop_{ false };
     std::atomic<bool> requestEvict_{ false };
     std::atomic<bool> requestRestore_{ false };
+    std::atomic<bool> requestResize_{ false };
+    std::atomic<uint32_t> targetMb_{ 0 };
+    std::atomic<uint32_t> pendingTargetMb_{ 0 };
     std::atomic<bool> busy_{ false };
     std::atomic<bool> evacuated_{ false };
     bool shutdownDone_ = false;

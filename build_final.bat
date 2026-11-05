@@ -13,12 +13,23 @@ set "OUTDIR=%ROOT%\build"
 set "OUT=%OUTDIR%\CHZM_SiliconFuse.exe"
 
 set "GXX="
-where g++ >nul 2>&1 && set "GXX=g++"
-if not defined GXX if exist "%LOCALAPPDATA%\Programs\mingw64\bin\g++.exe" set "GXX=%LOCALAPPDATA%\Programs\mingw64\bin\g++.exe"
-if not defined GXX if exist "C:\msys64\mingw64\bin\g++.exe" set "GXX=C:\msys64\mingw64\bin\g++.exe"
-if not defined GXX if exist "C:\mingw64\bin\g++.exe" set "GXX=C:\mingw64\bin\g++.exe"
+for %%P in ("%LOCALAPPDATA%\Programs\mingw64\bin\g++.exe"
+            "C:\msys64\mingw64\bin\g++.exe"
+            "C:\mingw64\bin\g++.exe") do (
+    if not defined GXX if exist %%P set "GXX=%%~fP"
+)
+if not defined GXX for /f "delims=" %%I in ('where g++ 2^>nul') do (
+    if not defined GXX set "GXX=%%I"
+)
 if not defined GXX (
     echo [FAIL] MinGW-w64 g++ not found.
+    exit /b 1
+)
+
+for %%I in ("%GXX%") do set "BINDIR=%%~dpI"
+set "WINDRES=%BINDIR%windres.exe"
+if not exist "%WINDRES%" (
+    echo [FAIL] windres.exe not found next to g++.
     exit /b 1
 )
 
@@ -27,6 +38,13 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 echo [INFO] Compiler : %GXX%
 echo [INFO] Output   : %OUT%
 
+echo [INFO] Resources: src\app.rc
+"%WINDRES%" -I "%ROOT%\src" -O coff -o "%OUTDIR%\app_res.o" "%ROOT%\src\app.rc"
+if errorlevel 1 (
+    echo [FAIL] windres failed.
+    exit /b 1
+)
+
 "%GXX%" -std=c++20 -O2 -mavx2 -municode -Wl,--subsystem,windows -static -w ^
     -I"%ROOT%\src" ^
     "%ROOT%\src\main.cpp" ^
@@ -34,6 +52,7 @@ echo [INFO] Output   : %OUT%
     "%ROOT%\src\engine\StorageBridge.cpp" ^
     "%ROOT%\src\engine\PagingManager.cpp" ^
     "%ROOT%\src\gui\MainWindow.cpp" ^
+    "%OUTDIR%\app_res.o" ^
     -o "%OUT%" ^
     -ld3d12 -ldxgi -lole32 -lpsapi -lgdi32 -lmsimg32 -lshell32 -luser32 -ldwmapi
 

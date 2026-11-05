@@ -45,15 +45,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int showC
         return 0;
     }
 
-    // 4 slices x 64 MB dirty window = 256 MB host staging.
+    // Up to 6 slices x 64 MB dirty window = 384 MB host staging.
     StorageBridge bridge;
-    if (!bridge.Init(dataDir, 4ull * 64ull * 1024ull * 1024ull)) {
+    if (!bridge.Init(dataDir, 6ull * 64ull * 1024ull * 1024ull)) {
         if (mutex) CloseHandle(mutex);
         return 2;
     }
 
+    // targetMb = 0: the pool sizes itself for the detected adapter.
     VramPool pool;
-    if (!pool.Init(&bridge, 4096, 1024, logPath)) {
+    if (!pool.Init(&bridge, 0, 1024, logPath)) {
         if (mutex) CloseHandle(mutex);
         return 3;
     }

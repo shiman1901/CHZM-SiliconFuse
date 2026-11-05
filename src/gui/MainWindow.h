@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <cstdint>
 #include <string>
 
 class VramPool;
@@ -30,6 +31,10 @@ private:
     void AddTrayIcon();
     void RemoveTrayIcon();
 
+    void CyclePool();
+    uint32_t MaxPoolMb() const;
+    std::wstring PoolCellText() const;
+
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
     VramPool* pool_ = nullptr;
@@ -41,8 +46,15 @@ private:
 
     bool autostart_ = false;
     bool trayAdded_ = false;
+    bool poolAuto_ = true;
+    bool poolHover_ = false;
+    uint32_t poolMb_ = 0;
+
+    HICON iconLarge_ = nullptr;
+    HICON iconSmall_ = nullptr;
 
     RECT capsuleRect_{};
     RECT minimizeRect_{};
     RECT autostartRect_{};
+    RECT poolRect_{};
 };

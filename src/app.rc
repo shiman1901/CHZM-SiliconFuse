@@ -1,0 +1,4 @@
+// CHZM//SILICONFUSE resource script.
+// Icon group 1 is loaded by MainWindow for the window class and the tray.
+
+1 ICON "gui/app.ico"

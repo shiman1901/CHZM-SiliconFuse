@@ -121,7 +121,9 @@ bool VramPool::Init(StorageBridge* bridge, uint32_t targetMb, uint32_t sliceMb,
 
     if (!CreateDevice()) return false;
 
-    const uint64_t targetBytes = (uint64_t)targetMb * kMb;
+    // targetMb == 0 means "auto": size for the adapter we just picked.
+    targetMb_ = targetMb ? targetMb : autoTargetMb_;
+    const uint64_t targetBytes = (uint64_t)targetMb_.load() * kMb;
     sliceBytes_ = (uint64_t)sliceMb * kMb;
 
     // Staging must cover one dirty window.
@@ -157,21 +159,53 @@ bool VramPool::CreateDevice()
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
 
-    IDXGIAdapter1* adapter1 = nullptr;
+    // Discrete adapter policy: NVIDIA first (0x10DE), otherwise the discrete
+    // adapter with the largest dedicated VRAM. Software adapters are skipped.
+    IDXGIAdapter1* best = nullptr;
+    uint64_t bestVram = 0;
+    bool bestNvidia = false;
+
     for (UINT i = 0;; ++i) {
         IDXGIAdapter1* candidate = nullptr;
         if (factory->EnumAdapters1(i, &candidate) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{};
         candidate->GetDesc1(&desc);
-        if (desc.VendorId == 0x10DE &&
-            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-            adapter1 = candidate;
-            break;
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+            candidate->Release();
+            continue;
         }
-        candidate->Release();
+        const bool nvidia = desc.VendorId == 0x10DE;
+        const uint64_t vram = desc.DedicatedVideoMemory;
+        const bool replace = !best || (nvidia && !bestNvidia) ||
+                             (nvidia == bestNvidia && vram > bestVram);
+        if (replace) {
+            if (best) best->Release();
+            best = candidate;
+            bestVram = vram;
+            bestNvidia = nvidia;
+        } else {
+            candidate->Release();
+        }
     }
     factory->Release();
-    if (!adapter1) return false;
+    if (!best) return false;
+
+    adapterVramBytes_ = bestVram;
+    const uint64_t vramGb = adapterVramBytes_ / (1024ull * 1024ull * 1024ull);
+    if (vramGb <= 6) {
+        autoTargetMb_ = 1024;
+    } else if (vramGb < 11) {
+        autoTargetMb_ = 2048;
+    } else if (vramGb < 16) {
+        autoTargetMb_ = 4096;
+    } else {
+        autoTargetMb_ = 6144;
+    }
+
+    IDXGIAdapter1* adapter1 = best;
+    Log(L"[pool] adapter vram=%llu MB auto_target=%u MB nvidia=%d",
+        (unsigned long long)(adapterVramBytes_ / kMb), autoTargetMb_,
+        bestNvidia ? 1 : 0);
 
     if (FAILED(adapter1->QueryInterface(IID_PPV_ARGS(&adapter3_))) ||
         FAILED(D3D12CreateDevice(adapter1, D3D_FEATURE_LEVEL_11_0,
@@ -306,6 +340,58 @@ bool VramPool::AllocateSlices(uint64_t targetBytes, uint64_t sliceBytes)
         (unsigned long long)(totalBytes_ / kMb),
         (unsigned long long)slices_.size());
     return !slices_.empty();
+}
+
+// Grows or shrinks the pool in place. Runs on the monitor thread only, so the
+// slice vector needs no lock; spill offsets of surviving slices stay valid
+// because slices are trimmed from the tail.
+bool VramPool::ResizeTo(uint32_t targetMb)
+{
+    const uint64_t target = (uint64_t)targetMb * kMb;
+    const uint32_t previous = targetMb_.exchange(targetMb);
+    Log(L"[pool] resize %u MB -> %u MB", previous, targetMb);
+
+    while (!slices_.empty() && totalBytes_ > target) {
+        Slice& slice = slices_.back();
+        if (slice.inVram) {
+            double ms = 0.0;
+            if (!EvictSlice(slices_.size() - 1, ms)) return false;
+        }
+        if (slice.mapped) {
+            slice.resource->Unmap(0, nullptr);
+            slice.mapped = false;
+        }
+        if (slice.resource) slice.resource->Release();
+        totalBytes_ -= slice.size;
+        dirtyTotal_ -= slice.dirty;
+        slices_.pop_back();
+    }
+
+    while (totalBytes_ + sliceBytes_ <= target) {
+        const size_t index = slices_.size();
+        if (!AddSlice(sliceBytes_)) break;
+        Slice& slice = slices_.back();
+        Avx2Fill(slice.cpu, (size_t)slice.dirty, 0x5EEDF00Dull + index * 0x1000000ull);
+        slice.resource->Unmap(0, nullptr);
+        slice.mapped = false;
+        slice.cpu = nullptr;
+    }
+
+    int resident = 0;
+    for (const auto& s : slices_) if (s.inVram) ++resident;
+    evacuated_ = !slices_.empty() && resident == 0;
+
+    Log(L"[pool] resized: %llu MB in %llu slices (%d resident)",
+        (unsigned long long)(totalBytes_ / kMb),
+        (unsigned long long)slices_.size(), resident);
+    return true;
+}
+
+void VramPool::RequestResize(uint32_t targetMb)
+{
+    pendingTargetMb_.store(targetMb);
+    requestResize_.store(true);
+    if (budgetEvent_) SetEvent(budgetEvent_);
 }
 
 bool VramPool::BeginList()
@@ -472,6 +558,12 @@ void VramPool::MonitorLoop()
         uint64_t freeNow = 0;
         const bool nvmlOk = QueryNvmlFree(freeNow);
 
+        if (requestResize_.exchange(false)) {
+            busy_.store(true);
+            ResizeTo(pendingTargetMb_.load());
+            busy_.store(false);
+        }
+
         if (requestEvict_.exchange(false)) {
             busy_.store(true);
             double ms = 0.0;
@@ -487,7 +579,7 @@ void VramPool::MonitorLoop()
             busy_.store(true);
             double ms = 0.0;
             if (slices_.empty()) {
-                AllocateSlices(4096 * kMb, sliceBytes_);
+                AllocateSlices((uint64_t)targetMb_.load() * kMb, sliceBytes_);
             }
             if (RestoreAll(ms)) {
                 evacuated_.store(false);
@@ -532,7 +624,7 @@ void VramPool::MonitorLoop()
         if (slices_.empty() && !stop_.load()) {
             unsigned util = 0;
             if (QueryNvmlUtil(util) && util < 20) {
-                AllocateSlices(4096 * kMb, sliceBytes_);
+                AllocateSlices((uint64_t)targetMb_.load() * kMb, sliceBytes_);
                 PublishStats();
             }
         }
@@ -570,6 +662,9 @@ void VramPool::PublishStats()
     stats.lastEvictMs = stats_.lastEvictMs;
     stats.lastRestoreMs = stats_.lastRestoreMs;
     stats.lastDmaMBps = lastDmaMBps_;
+    stats.targetMb = targetMb_.load();
+    stats.autoTargetMb = autoTargetMb_;
+    stats.adapterVramBytes = adapterVramBytes_;
 
     std::lock_guard<std::mutex> lock(statsMutex_);
     stats_ = stats;

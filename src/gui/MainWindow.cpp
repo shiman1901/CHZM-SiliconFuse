@@ -137,6 +137,8 @@ MainWindow::~MainWindow()
     if (fontTitle_) DeleteObject(fontTitle_);
     if (fontLabel_) DeleteObject(fontLabel_);
     if (fontMono_) DeleteObject(fontMono_);
+    if (iconSmall_) DestroyIcon(iconSmall_);
+    if (iconLarge_) DestroyIcon(iconLarge_);
 }
 
 bool MainWindow::Create(HINSTANCE instance, VramPool* pool, const std::wstring& exePath)
@@ -153,6 +155,18 @@ bool MainWindow::Create(HINSTANCE instance, VramPool* pool, const std::wstring& 
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kClassName;
+
+    // Embedded icon group 1 (src/app.rc). LoadImage keeps our own handles so
+    // the shell also shows them for the tray and the taskbar.
+    iconLarge_ = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                  GetSystemMetrics(SM_CXICON),
+                                  GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    iconSmall_ = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                  GetSystemMetrics(SM_CXSMICON),
+                                  GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    wc.hIcon = iconLarge_;
+    wc.hIconSm = iconSmall_;
+
     RegisterClassExW(&wc);
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -207,7 +221,7 @@ void MainWindow::AddTrayIcon()
     data.uID = 1;
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = kTrayMessage;
-    data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    data.hIcon = iconSmall_ ? iconSmall_ : LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(data.szTip, L"CHZM//SILICONFUSE");
     Shell_NotifyIconW(NIM_ADD, &data);
     trayAdded_ = true;
@@ -276,6 +290,65 @@ void MainWindow::TogglePower()
 void MainWindow::OnTimer()
 {
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+std::wstring MainWindow::PoolCellText() const
+{
+    if (!pool_) return L"--";
+    const uint32_t mb = poolAuto_ ? pool_->AutoTargetMb() : poolMb_;
+    return FormatGb1((uint64_t)mb * 1024ull * 1024ull) + L" GB" +
+           (poolAuto_ ? L" [AUTO]" : L" [FIXED]");
+}
+
+// Manual steps may never exceed half of the adapter's VRAM. The capacity is
+// rounded to the marketed size first (a 12 GB card reports ~11.7 GB to DXGI),
+// so a 12 GB GPU can still reach the 6 GB step.
+uint32_t MainWindow::MaxPoolMb() const
+{
+    if (!pool_) return 1024;
+    const uint64_t vramMb = pool_->AdapterVramBytes() / (1024ull * 1024ull);
+    const uint64_t vramGb = (vramMb + 512ull) / 1024ull;
+    uint64_t cap = vramGb * 512ull;
+    if (cap > 6144) cap = 6144;
+    return (uint32_t)cap;
+}
+
+// AUTO -> 1.0 -> 2.0 -> 4.0 -> 6.0 -> AUTO, skipping steps above the cap.
+void MainWindow::CyclePool()
+{
+    if (!pool_) return;
+
+    static const uint32_t kSteps[] = { 1024, 2048, 4096, 6144 };
+    const uint32_t maxMb = MaxPoolMb();
+    const uint32_t current = poolAuto_ ? 0 : poolMb_;
+
+    uint32_t next = 0;
+    if (current == 0) {
+        for (uint32_t mb : kSteps) {
+            if (mb <= maxMb) { next = mb; break; }
+        }
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            if (kSteps[i] != current) continue;
+            for (int j = i + 1; j < 4; ++j) {
+                if (kSteps[j] <= maxMb) { next = kSteps[j]; break; }
+            }
+            break;
+        }
+    }
+
+    if (next == 0) {
+        poolAuto_ = true;
+        poolMb_ = (uint32_t)pool_->AutoTargetMb();
+        pool_->RequestResize(pool_->AutoTargetMb());
+    } else {
+        poolAuto_ = false;
+        poolMb_ = next;
+        pool_->RequestResize(next);
+    }
+    pool_->Log(L"[ui] pool step -> %u MB (auto=%d, cap=%u MB)",
+               poolMb_, poolAuto_ ? 1 : 0, maxMb);
+    InvalidateRect(hwnd_, &poolRect_, FALSE);
 }
 
 void MainWindow::Paint()
@@ -409,7 +482,11 @@ void MainWindow::DrawScene(HDC dc, int width, int height)
     SelectObject(dc, oldPen);
     DeleteObject(pen);
 
-    DrawLabel(dc, fontMono_, L"20 GB  UNIFIED SILICON TIER",
+    const double ramGb = (double)memory.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+    const double poolGb = (double)stats.poolBytes / (1024.0 * 1024.0 * 1024.0);
+    wchar_t tier[96];
+    swprintf_s(tier, L"%.0f GB  UNIFIED SILICON TIER", ramGb + poolGb);
+    DrawLabel(dc, fontMono_, tier,
               RECT{ barX, bracketY + 11, barX + contentW, bracketY + 30 }, kDim);
 
     wchar_t commit[96];
@@ -443,20 +520,30 @@ void MainWindow::DrawScene(HDC dc, int width, int height)
     const int statsY = 252;
     DrawRule(dc, pad, statsY - 14, width - pad, kRule);
 
-    struct Block { const wchar_t* label; std::wstring value; };
+    struct Block { const wchar_t* label; std::wstring value; COLORREF color; };
     const Block blocks[4] = {
-        { L"POOL", FormatGb1(stats.poolBytes) + L" GB" },
-        { L"PAGES", std::to_wstring(stats.residentSlices) + L" / " + std::to_wstring(stats.sliceCount) },
-        { L"BUDGET", FormatMb(stats.budgetBytes) },
-        { L"NVML FREE", FormatMb(stats.nvmlFreeBytes) },
+        { L"POOL", PoolCellText(), poolAuto_ ? kText : kViolet },
+        { L"PAGES", std::to_wstring(stats.residentSlices) + L" / " + std::to_wstring(stats.sliceCount), kText },
+        { L"BUDGET", FormatMb(stats.budgetBytes), kText },
+        { L"NVML FREE", FormatMb(stats.nvmlFreeBytes), kText },
     };
     const int blockW = contentW / 4;
+
+    // The POOL cell is the only interactive metric: hover highlights it and a
+    // click cycles the target size.
+    poolRect_ = RECT{ pad - 10, statsY - 10, pad + blockW - 6, statsY + 44 };
+    if (poolHover_) {
+        DrawPanel(dc, poolRect_, Mix(kPanel, kBaseTop, 30),
+                  Mix(kPanelBorder, kViolet, 55), 10);
+    }
+
     for (int i = 0; i < 4; ++i) {
         const int x = pad + blockW * i;
         DrawLabel(dc, fontLabel_, blocks[i].label,
                   RECT{ x, statsY, x + blockW - 10, statsY + 18 }, kDim);
         DrawLabel(dc, fontMono_, blocks[i].value,
-                  RECT{ x, statsY + 18, x + blockW - 10, statsY + 40 }, kText);
+                  RECT{ x, statsY + 18, x + blockW - 10, statsY + 40 },
+                  blocks[i].color);
     }
 
     DrawRule(dc, pad, 312, width - pad, kRule);
@@ -539,6 +626,10 @@ LRESULT MainWindow::Dispatch(UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (PtInRect(&poolRect_, pt)) {
+            CyclePool();
+            return 0;
+        }
         if (PtInRect(&capsuleRect_, pt)) {
             TogglePower();
             return 0;
@@ -553,6 +644,28 @@ LRESULT MainWindow::Dispatch(UINT msg, WPARAM wParam, LPARAM lParam)
         }
         break;
     }
+
+    case WM_MOUSEMOVE: {
+        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        const bool hover = PtInRect(&poolRect_, pt) != 0;
+        if (hover != poolHover_) {
+            poolHover_ = hover;
+            InvalidateRect(hwnd_, &poolRect_, FALSE);
+            if (hover) {
+                TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd_, 0 };
+                TrackMouseEvent(&track);
+            }
+        }
+        SetCursor(LoadCursorW(nullptr, hover ? IDC_HAND : IDC_ARROW));
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (poolHover_) {
+            poolHover_ = false;
+            InvalidateRect(hwnd_, &poolRect_, FALSE);
+        }
+        return 0;
 
     case WM_CLOSE:
         ShowWindow(hwnd_, SW_HIDE);
